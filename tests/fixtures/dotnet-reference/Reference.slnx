@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="Dashboard/Dashboard.csproj" />
+  <Project Path="Shared/Shared.csproj" />
+</Solution>
