@@ -260,12 +260,24 @@ internal sealed partial class SolutionModelBuilder(DotNetScannerLimits limits)
                 }
                 if (kind == "PackageReference")
                 {
-                    var version = ((string?)item.Attribute("Version") ??
-                        item.Elements().FirstOrDefault(child => child.Name.LocalName == "Version" && !HasCondition(child))?.Value)?.Trim();
-                    var versionUnknown = item.Elements().Any(child => child.Name.LocalName == "Version" && HasCondition(child)) ||
-                                         !IsLiteral(version ?? string.Empty);
-                    if (versionUnknown) version = null;
                     var identity = include.ToLowerInvariant();
+                    var versionElements = item.Elements().Where(child => child.Name.LocalName == "Version").ToArray();
+                    var packageMetadataUnknown = item.Attributes().Any(attribute => !attribute.IsNamespaceDeclaration &&
+                        attribute.Name.LocalName is not ("Include" or "Version")) ||
+                        item.Elements().Any(child => child.Name.LocalName != "Version") ||
+                        versionElements.Length > 1 || versionElements.Any(child => child.HasAttributes || child.HasElements);
+                    if (packageMetadataUnknown)
+                    {
+                        packages.Remove(identity);
+                        taintedPackages.Add(identity);
+                        diagnostics.Add(Warning("DOTNET_NUGET_COMPILE_ASSETS_UNEVALUATED", file.Path,
+                            $"NuGet package '{include}' has aliases, asset filters, or unsupported metadata; its compile-time availability was omitted.", subject));
+                        continue;
+                    }
+                    var version = ((string?)item.Attribute("Version") ??
+                        versionElements.FirstOrDefault()?.Value)?.Trim();
+                    var versionUnknown = !IsLiteral(version ?? string.Empty);
+                    if (versionUnknown) version = null;
                     if (!packageItemsUnknown && !taintedPackages.Contains(identity))
                         packages[identity] = new(identity, version, file.Path, Range(item));
                     if (version is null)

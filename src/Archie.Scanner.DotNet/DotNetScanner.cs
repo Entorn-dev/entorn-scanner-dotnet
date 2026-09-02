@@ -8,7 +8,7 @@ namespace Archie.Scanner.DotNet;
 public sealed class DotNetScanner(DotNetScannerLimits? limits = null)
 {
     private const string ScannerId = "archie.dotnet";
-    private const string ScannerVersion = "1.0.0";
+    private const string ScannerVersion = "1.1.0";
     private readonly DotNetScannerLimits limits = limits ?? new();
 
     public async Task<DotNetScanResult> ScanAsync(string repositoryRoot, CancellationToken cancellationToken)
@@ -117,6 +117,61 @@ public sealed class DotNetScanner(DotNetScannerLimits? limits = null)
                                 ("ownership", "service-endpoint"), ("label", $"exposes {detection.Method} {detection.Template}"))));
                 }
             }
+
+            var messaging = await MessagingScanner.ScanAsync(project, cancellationToken);
+            diagnostics.AddRange(messaging.Diagnostics);
+            if (serviceCandidate is null && messaging.Detections.Count > 0)
+            {
+                diagnostics.Add(Diagnostic("DOTNET_MESSAGE_OWNER_UNRESOLVED", "warning",
+                    $"Project '{project.Path}' contains semantically resolved messaging operations but is not a safely classified deployable; no ownership relationships were emitted.",
+                    project.Key, project.Path));
+                continue;
+            }
+            foreach (var detection in messaging.Detections)
+            {
+                var channel = ChannelCandidate(detection);
+                var stable = $"{project.Path}:{detection.Relationship}:{detection.Provider}:{detection.ChannelKind}:{detection.Name}:{detection.Path}:{detection.Range.StartLine}:{detection.Range.StartColumn}";
+                observations.Add(Relationship($"messaging:{stable}", detection.Relationship, serviceCandidate!, channel,
+                    detection.Path, detection.Range, detection.Rule, Confidence.Confirmed,
+                    Properties(("provider", detection.Provider), ("channelKind", detection.ChannelKind),
+                        ("topic", detection.Topic), ("subscription", detection.Subscription),
+                        ("contract", detection.Contract),
+                        ("label", $"{(detection.Relationship == EdgeKind.Publishes ? "publishes to" : "subscribes to")} {detection.Name}"))));
+
+                if (detection.Subscription is not null && detection.Topic is not null)
+                {
+                    var topic = ChannelCandidate(detection with
+                    {
+                        ChannelKind = "topic",
+                        Name = detection.Topic,
+                        Subscription = null
+                    });
+                    observations.Add(Relationship($"servicebus-subscription:{detection.Provider}:{detection.Topic}:{detection.Subscription}",
+                        EdgeKind.Contains, topic, channel, detection.Path, detection.Range, detection.Rule, Confidence.Confirmed,
+                        Properties(("provider", detection.Provider), ("channelKind", "subscription"),
+                            ("subscription", detection.Subscription), ("label", $"contains subscription {detection.Subscription}"))));
+                }
+
+                if (detection.Contract is not null)
+                {
+                    var contract = ContractCandidate(detection.Contract);
+                    observations.Add(Relationship($"message-contract:{stable}:{detection.Contract}", EdgeKind.UsesContract,
+                        channel, contract, detection.Path, detection.Range, detection.Rule, Confidence.Confirmed,
+                        Properties(("provider", detection.Provider), ("contract", detection.Contract),
+                            ("label", $"uses {detection.Contract}"))));
+                }
+            }
+        }
+
+        foreach (var group in observations.OfType<RelationshipObservation>()
+                     .Where(item => item.Relationship == EdgeKind.UsesContract && item.From.Kind == NodeKind.MessageChannel)
+                     .GroupBy(item => item.From.Key, StringComparer.Ordinal))
+        {
+            var contracts = group.Select(item => item.To.Key).Distinct(StringComparer.Ordinal).ToArray();
+            if (contracts.Length > 1)
+                diagnostics.Add(Diagnostic("DOTNET_MESSAGE_CONTRACT_AMBIGUOUS", "warning",
+                    $"Message channel '{group.First().From.Name}' is associated with {contracts.Length} distinct resolved contracts; all remain separate.",
+                    group.First().From.Key, group.Key));
         }
 
         if (diagnostics.Any(item => item.Severity == "error")) return new([], diagnostics.OrderBy(item => item.Id, StringComparer.Ordinal).ToArray());
@@ -152,6 +207,23 @@ public sealed class DotNetScanner(DotNetScannerLimits? limits = null)
             Properties(("httpMethod", endpoint.Method), ("routeTemplate", endpoint.Template),
                 ("ownerProject", project.Path), ("detectionRule", endpoint.Rule)));
     }
+
+    private static EntityCandidate ChannelCandidate(MessageChannelDetection detection)
+    {
+        var identityKind = detection.Provider == "azure-service-bus" && detection.Subscription is null
+            ? "entity"
+            : detection.ChannelKind;
+        var identity = $"{detection.Provider}:{identityKind}:{detection.Name}";
+        return new($"dotnet:message-channel:{Uri.EscapeDataString(identity)}", NodeKind.MessageChannel, null,
+            detection.Name, Resolution.Resolved,
+            new Dictionary<string, string>(StringComparer.Ordinal) { ["channel"] = identity },
+            Properties(("provider", detection.Provider), ("channelKind", detection.ChannelKind),
+                ("topic", detection.Topic), ("subscription", detection.Subscription)));
+    }
+
+    private static EntityCandidate ContractCandidate(string contract) =>
+        Candidate($"dotnet:event-contract:{Uri.EscapeDataString(contract)}", NodeKind.EventContract, contract,
+            Resolution.Resolved, Properties(("contractType", contract), ("language", "dotnet")));
 
     private static EntityCandidate Candidate(
         string key,

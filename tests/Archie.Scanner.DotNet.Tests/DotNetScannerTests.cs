@@ -3,12 +3,43 @@ using System.Diagnostics;
 using Archie.Contracts;
 using Archie.Core;
 using Archie.Scanner.DotNet;
+using Microsoft.CodeAnalysis.CSharp;
+using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Xunit;
 
 namespace Archie.Scanner.DotNet.Tests;
 
 public sealed class DotNetScannerTests
 {
+    [Fact]
+    public void SenderWriteSyntaxAcceptsOnlyOrdinaryDirectLocalDeclarations()
+    {
+        var root = CSharpSyntaxTree.ParseText("""
+            class Flow
+            {
+                async void Send()
+                {
+                    var ordinary = CreateSender();
+                    using var usingDeclaration = CreateSender();
+                    await using var awaitUsingDeclaration = CreateSender();
+                }
+            }
+            """).GetRoot();
+        var block = root.DescendantNodes().OfType<MethodDeclarationSyntax>().Single().Body!;
+        var declarations = block.Statements.OfType<LocalDeclarationStatementSyntax>()
+            .ToDictionary(item => item.Declaration.Variables.Single().Identifier.ValueText, StringComparer.Ordinal);
+
+        Assert.True(IsDirect(declarations["ordinary"]));
+        Assert.False(IsDirect(declarations["usingDeclaration"]));
+        Assert.False(IsDirect(declarations["awaitUsingDeclaration"]));
+
+        bool IsDirect(LocalDeclarationStatementSyntax statement)
+        {
+            var variable = statement.Declaration.Variables.Single();
+            return MessagingScanner.IsDirectSenderWrite(variable, variable.Initializer!.Value, block);
+        }
+    }
+
     [Fact]
     public void WorkerBudgetsMatchTheTrustedSliceFiveSupervisor()
     {
@@ -484,9 +515,388 @@ public sealed class DotNetScannerTests
         AssertEndpoint(result.Observations.OfType<EntityObservation>(), "GET", "/root/child");
     }
 
+    [Fact]
+    public async Task KafkaOperationsRequireResolvedConfluentSymbolsAndEmitTopicsContractsAndDiagnostics()
+    {
+        using var temporary = new TemporaryDirectory();
+        await WriteProject(temporary.Path, "Kafka.csproj", ExecutableProject("Confluent.Kafka"));
+        await WriteProject(temporary.Path, "Flow.cs", """
+            using Confluent.Kafka;
+            public sealed record OrderSubmitted(string Id);
+            public sealed class Flow
+            {
+                public Task Publish(IProducer<string, OrderSubmitted> producer) =>
+                    producer.ProduceAsync("order.submitted", new Message<string, OrderSubmitted>());
+                public void Consume(IConsumer<string, OrderSubmitted> consumer) => consumer.Subscribe("order.submitted");
+                public void Dynamic(IConsumer<string, object> consumer, string topic) => consumer.Subscribe(topic);
+            }
+            public sealed class Lookalike
+            {
+                public void Produce(string topic, object value) { }
+                public void Subscribe(string topic) { }
+                public void Ignore() { Produce("fake.kafka", new object()); Subscribe("fake.kafka"); }
+            }
+            """);
+
+        var result = await new DotNetScanner().ScanAsync(temporary.Path, CancellationToken.None);
+        var messaging = Messaging(result);
+
+        Assert.Equal(2, messaging.Count(item => item.To.Name == "order.submitted"));
+        Assert.Contains(messaging, item => item.Relationship == EdgeKind.Publishes && item.Properties["contract"].GetString() == "OrderSubmitted");
+        Assert.Contains(messaging, item => item.Relationship == EdgeKind.Subscribes && item.Properties["provider"].GetString() == "kafka");
+        Assert.DoesNotContain(messaging, item => item.To.Name == "fake.kafka");
+        Assert.Contains(result.Diagnostics, item => item.Code == "DOTNET_MESSAGE_DESTINATION_UNRESOLVED");
+        Assert.All(messaging, item => Assert.Equal(Confidence.Confirmed, item.Evidence.Confidence));
+    }
+
+    [Fact]
+    public async Task ServiceBusOperationsRequireResolvedAzureSymbolsAndPreserveSubscriptionUncertainty()
+    {
+        using var temporary = new TemporaryDirectory();
+        await WriteProject(temporary.Path, "Bus.csproj", ExecutableProject("Azure.Messaging.ServiceBus"));
+        await WriteProject(temporary.Path, "Flow.cs", """
+            using Azure.Messaging.ServiceBus;
+            public sealed record FulfilmentRequested(string Id);
+            public sealed class Flow
+            {
+                public async Task Configure(ServiceBusClient client, string dynamicName)
+                {
+                    var sender = client.CreateSender("fulfilment.requested");
+                    await sender.SendMessageAsync(new ServiceBusMessage(BinaryData.FromObjectAsJson(new FulfilmentRequested("1"))));
+                    var processor = client.CreateProcessor(subscriptionName: "notifications", topicName: "dispatch.events");
+                    var namedFirst = client.CreateProcessor(topicName: "named-first.events", "named-first-subscription");
+                    var positionalNamed = client.CreateProcessor("positional-named.events", subscriptionName: "positional-named-subscription");
+                    _ = processor;
+                    _ = namedFirst;
+                    _ = positionalNamed;
+                    var dynamicSender = client.CreateSender(dynamicName);
+                    _ = dynamicSender;
+                }
+            }
+            public sealed class ServiceBusClientLookalike
+            {
+                public Sender CreateSender(string name) => new();
+                public Processor CreateProcessor(string topic, string subscription) => new();
+            }
+            public sealed class Sender { public Task SendMessageAsync(object message) => Task.CompletedTask; }
+            public sealed class Processor { }
+            """);
+
+        var result = await new DotNetScanner().ScanAsync(temporary.Path, CancellationToken.None);
+        var messaging = Messaging(result);
+
+        Assert.Contains(messaging, item => item.Relationship == EdgeKind.Publishes && item.To.Name == "fulfilment.requested" &&
+            item.Properties["contract"].GetString() == "FulfilmentRequested");
+        Assert.Contains(messaging, item => item.Relationship == EdgeKind.Subscribes && item.To.Name == "dispatch.events/notifications" &&
+            item.Properties["subscription"].GetString() == "notifications");
+        Assert.Contains(messaging, item => item.Relationship == EdgeKind.Subscribes &&
+            item.To.Name == "named-first.events/named-first-subscription");
+        Assert.Contains(messaging, item => item.Relationship == EdgeKind.Subscribes &&
+            item.To.Name == "positional-named.events/positional-named-subscription");
+        Assert.Contains(result.Observations.OfType<RelationshipObservation>(), item => item.Relationship == EdgeKind.Contains &&
+            item.From.Name == "dispatch.events" && item.To.Name == "dispatch.events/notifications");
+        Assert.Contains(result.Diagnostics, item => item.Code == "DOTNET_MESSAGE_DESTINATION_UNRESOLVED");
+        Assert.Contains(result.Diagnostics, item => item.Code == "DOTNET_MESSAGE_CONTRACT_UNRESOLVED");
+    }
+
+    [Fact]
+    public async Task AzureFunctionsBindingsRequireKnownAttributesAndResolveTriggerAndOutputContracts()
+    {
+        using var temporary = new TemporaryDirectory();
+        await WriteProject(temporary.Path, "Functions.csproj", ExecutableProject(
+            "Microsoft.Azure.Functions.Worker", "Microsoft.Azure.Functions.Worker.Extensions.ServiceBus"));
+        await WriteProject(temporary.Path, "Functions.cs", """
+            using Microsoft.Azure.Functions.Worker;
+            public sealed record FulfilmentRequested(string Id);
+            public sealed record DispatchRequested(string Id);
+            public sealed class Functions
+            {
+                [Function("Fulfil")]
+                [ServiceBusOutput("dispatch.requested")]
+                public DispatchRequested Run([ServiceBusTrigger("fulfilment.requested")] FulfilmentRequested request) => new(request.Id);
+                [Function("TopicInput")]
+                [ServiceBusOutput(entityType: ServiceBusEntityType.Topic, queueOrTopicName: "events.out")]
+                public DispatchRequested Topic(
+                    [ServiceBusTrigger(subscriptionName: "workers", topicName: "events.in")] FulfilmentRequested request) => new(request.Id);
+                [Function("NamedFirst")]
+                [ServiceBusOutput(queueOrTopicName: "named-first.out", ServiceBusEntityType.Topic)]
+                public DispatchRequested NamedFirst(
+                    [ServiceBusTrigger(topicName: "named-first.in", "named-first-subscription")] FulfilmentRequested request) => new(request.Id);
+                [Function("PositionalNamed")]
+                [ServiceBusOutput("positional-named.out", entityType: ServiceBusEntityType.Topic)]
+                public DispatchRequested PositionalNamed(
+                    [ServiceBusTrigger("positional-named.in", subscriptionName: "positional-named-subscription")] FulfilmentRequested request) => new(request.Id);
+            }
+            namespace Hostile
+            {
+                public sealed class FunctionAttribute(string name) : Attribute { }
+                public sealed class ServiceBusTriggerAttribute(string name) : Attribute { }
+                public sealed class ServiceBusOutputAttribute(string name) : Attribute { }
+                public sealed class Fake
+                {
+                    [Function("Fake")]
+                    [ServiceBusOutput("fake.output")]
+                    public object Run([ServiceBusTrigger("fake.input")] object value) => value;
+                }
+            }
+            """);
+
+        var result = await new DotNetScanner().ScanAsync(temporary.Path, CancellationToken.None);
+        var messaging = Messaging(result);
+
+        Assert.Contains(messaging, item => item.Relationship == EdgeKind.Subscribes && item.To.Name == "fulfilment.requested" &&
+            item.Properties["contract"].GetString() == "FulfilmentRequested");
+        Assert.Contains(messaging, item => item.Relationship == EdgeKind.Publishes && item.To.Name == "dispatch.requested" &&
+            item.Properties["contract"].GetString() == "DispatchRequested" && item.Properties["channelKind"].GetString() == "queue" &&
+            !item.Properties.ContainsKey("topic"));
+        Assert.Contains(messaging, item => item.Relationship == EdgeKind.Subscribes && item.To.Name == "events.in/workers" &&
+            item.Properties["topic"].GetString() == "events.in" && item.Properties["subscription"].GetString() == "workers");
+        Assert.Contains(messaging, item => item.Relationship == EdgeKind.Publishes && item.To.Name == "events.out" &&
+            item.Properties["channelKind"].GetString() == "topic" && item.Properties["topic"].GetString() == "events.out");
+        Assert.Contains(messaging, item => item.Relationship == EdgeKind.Subscribes &&
+            item.To.Name == "named-first.in/named-first-subscription");
+        Assert.Contains(messaging, item => item.Relationship == EdgeKind.Publishes && item.To.Name == "named-first.out" &&
+            item.Properties["channelKind"].GetString() == "topic" && item.Properties["topic"].GetString() == "named-first.out");
+        Assert.Contains(messaging, item => item.Relationship == EdgeKind.Subscribes &&
+            item.To.Name == "positional-named.in/positional-named-subscription");
+        Assert.Contains(messaging, item => item.Relationship == EdgeKind.Publishes && item.To.Name == "positional-named.out" &&
+            item.Properties["channelKind"].GetString() == "topic" && item.Properties["topic"].GetString() == "positional-named.out");
+        Assert.DoesNotContain(messaging, item => item.To.Name.StartsWith("fake.", StringComparison.Ordinal));
+        Assert.Contains(result.Observations, item => item.Evidence.ExtractionMethod == "roslyn:semantic-azure-functions-service-bus-trigger");
+        Assert.Contains(result.Observations, item => item.Evidence.ExtractionMethod == "roslyn:semantic-azure-functions-service-bus-output");
+    }
+
+    [Fact]
+    public async Task MessagingCompilationAndPackageAvailabilityFailClosed()
+    {
+        using var temporary = new TemporaryDirectory();
+        await WriteProject(temporary.Path, "Missing.csproj", ExecutableProject());
+        await WriteProject(temporary.Path, "Flow.cs", """
+            using Azure.Messaging.ServiceBus;
+            using Confluent.Kafka;
+            using Microsoft.Azure.Functions.Worker;
+            public sealed class Flow
+            {
+                public void Kafka(IConsumer<string, Event> consumer) => consumer.Subscribe("must.not.exist");
+                public ServiceBusProcessor Bus(ServiceBusClient client) => client.CreateProcessor("must.not.exist");
+                [Function("Missing")]
+                public void Run([ServiceBusTrigger("must.not.exist")] Event value) { }
+            }
+            public sealed record Event(string Id);
+            """);
+
+        var result = await new DotNetScanner().ScanAsync(temporary.Path, CancellationToken.None);
+
+        Assert.Empty(Messaging(result));
+        Assert.Contains(result.Diagnostics, item => item.Code == "DOTNET_MESSAGING_COMPILATION_UNAVAILABLE");
+        Assert.DoesNotContain("must.not.exist", JsonSerializer.Serialize(result.Observations, ContractJson.Options), StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("<PackageReference Include=\"Confluent.Kafka\" Version=\"2.12.0\" ExcludeAssets=\"compile\" />")]
+    [InlineData("<PackageReference Include=\"Confluent.Kafka\" Version=\"2.12.0\" IncludeAssets=\"runtime\" />")]
+    [InlineData("<PackageReference Include=\"Confluent.Kafka\" Version=\"2.12.0\" Aliases=\"KafkaAlias\" />")]
+    [InlineData("<PackageReference Include=\"Confluent.Kafka\" Version=\"2.12.0\" UnknownMetadata=\"value\" />")]
+    [InlineData("<PackageReference Include=\"Confluent.Kafka\" Version=\"2.12.0\"><Aliases>KafkaAlias</Aliases></PackageReference>")]
+    [InlineData("<PackageReference Include=\"Confluent.Kafka\" Version=\"2.12.0\"><UnknownMetadata>value</UnknownMetadata></PackageReference>")]
+    public async Task MessagingPackageCompileAssetMetadataTaintsAvailability(string packageReference)
+    {
+        using var temporary = new TemporaryDirectory();
+        await WriteProject(temporary.Path, "Tainted.csproj", $$"""
+            <Project Sdk="Microsoft.NET.Sdk">
+              <PropertyGroup><OutputType>Library</OutputType><TargetFramework>net10.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings></PropertyGroup>
+              <ItemGroup>{{packageReference}}</ItemGroup>
+            </Project>
+            """);
+        await WriteProject(temporary.Path, "Flow.cs", """
+            using Confluent.Kafka;
+            public sealed record Event(string Id);
+            public sealed class Flow
+            {
+                public void Subscribe(IConsumer<string, Event> consumer) => consumer.Subscribe("tainted.kafka");
+            }
+            """);
+
+        var result = await new DotNetScanner().ScanAsync(temporary.Path, CancellationToken.None);
+
+        Assert.Empty(Messaging(result));
+        Assert.Contains(result.Diagnostics, item => item.Code == "DOTNET_NUGET_COMPILE_ASSETS_UNEVALUATED");
+        Assert.Contains(result.Diagnostics, item => item.Code == "DOTNET_MESSAGING_COMPILATION_UNAVAILABLE");
+        Assert.DoesNotContain(result.Observations.OfType<EntityObservation>(), item => item.Entity.Key == "dotnet:package:confluent.kafka");
+    }
+
+    [Fact]
+    public async Task ServiceBusSenderFlowRequiresOneDirectReachingLiteralAssignment()
+    {
+        using var temporary = new TemporaryDirectory();
+        await WriteProject(temporary.Path, "Bus.csproj", ExecutableProject("Azure.Messaging.ServiceBus"));
+        await WriteProject(temporary.Path, "Flow.cs", """
+            using Azure.Messaging.ServiceBus;
+            public sealed record Event(string Id);
+            public sealed record BatchEvent(string Id);
+            public sealed class Flow
+            {
+                private static ServiceBusSender Keep(ServiceBusSender sender) => sender;
+
+                public async Task Send(ServiceBusClient client, string dynamicName, bool condition)
+                {
+                    var valid = client.CreateSender("valid.direct");
+                    await valid.SendMessageAsync(cancellationToken: default,
+                        message: new ServiceBusMessage(BinaryData.FromObjectAsJson(new Event("0"))));
+                    ServiceBusSender validAssignment;
+                    validAssignment = client.CreateSender("valid.assignment");
+                    await validAssignment.SendMessagesAsync(cancellationToken: default,
+                        messages: new[] { new ServiceBusMessage(BinaryData.FromObjectAsJson(new BatchEvent("0"))) });
+                    var constant = client.CreateSender("stale.constant");
+                    constant = client.CreateSender("reassigned.constant");
+                    await constant.SendMessageAsync(new ServiceBusMessage(BinaryData.FromObjectAsJson(new Event("1"))));
+                    var dynamic = client.CreateSender("stale.dynamic");
+                    dynamic = client.CreateSender(dynamicName);
+                    await dynamic.SendMessageAsync(new ServiceBusMessage(BinaryData.FromObjectAsJson(new Event("2"))));
+                    var original = client.CreateSender("aliased");
+                    var alias = original;
+                    await alias.SendMessageAsync(new ServiceBusMessage(BinaryData.FromObjectAsJson(new Event("3"))));
+                    ServiceBusSender unbraced;
+                    if (true) unbraced = client.CreateSender("nested.unbraced");
+                    await unbraced.SendMessageAsync(new ServiceBusMessage(BinaryData.FromObjectAsJson(new Event("4"))));
+                    ServiceBusSender braced;
+                    if (true) { braced = client.CreateSender("nested.braced"); }
+                    await braced.SendMessageAsync(new ServiceBusMessage(BinaryData.FromObjectAsJson(new Event("5"))));
+                    ServiceBusSender loop;
+                    do loop = client.CreateSender("nested.loop"); while (false);
+                    await loop.SendMessageAsync(new ServiceBusMessage(BinaryData.FromObjectAsJson(new Event("6"))));
+                    var conditional = condition
+                        ? client.CreateSender("conditional.first")
+                        : client.CreateSender("conditional.second");
+                    await conditional.SendMessageAsync(new ServiceBusMessage(BinaryData.FromObjectAsJson(new Event("7"))));
+                    ServiceBusSender crossBlock;
+                    { crossBlock = client.CreateSender("nested.cross-block"); }
+                    await crossBlock.SendMessageAsync(new ServiceBusMessage(BinaryData.FromObjectAsJson(new Event("8"))));
+                    ServiceBusSender argument;
+                    Keep(argument = client.CreateSender("nested.argument"));
+                    await argument.SendMessageAsync(new ServiceBusMessage(BinaryData.FromObjectAsJson(new Event("9"))));
+                    ServiceBusSender discard;
+                    _ = (discard = client.CreateSender("nested.discard"));
+                    await discard.SendMessageAsync(new ServiceBusMessage(BinaryData.FromObjectAsJson(new Event("10"))));
+                    ServiceBusSender forClause;
+                    for (forClause = client.CreateSender("nested.for"); false;) { }
+                    await forClause.SendMessageAsync(new ServiceBusMessage(BinaryData.FromObjectAsJson(new Event("11"))));
+                    ServiceBusSender usingClause;
+                    await using (usingClause = client.CreateSender("nested.using")) { }
+                    await usingClause.SendMessageAsync(new ServiceBusMessage(BinaryData.FromObjectAsJson(new Event("12"))));
+                    await using ServiceBusSender usingDeclaration = client.CreateSender("nested.using-declaration");
+                    await usingDeclaration.SendMessageAsync(new ServiceBusMessage(BinaryData.FromObjectAsJson(new Event("13"))));
+                }
+            }
+            """);
+
+        var result = await new DotNetScanner().ScanAsync(temporary.Path, CancellationToken.None);
+
+        var publishes = Messaging(result).Where(item => item.Relationship == EdgeKind.Publishes).ToArray();
+        Assert.Equal(2, publishes.Length);
+        Assert.Contains(publishes, item => item.To.Name == "valid.direct" && item.Properties["contract"].GetString() == "Event");
+        Assert.Contains(publishes, item => item.To.Name == "valid.assignment" && item.Properties["contract"].GetString() == "BatchEvent");
+        Assert.Equal(13, result.Diagnostics.Count(item => item.Code == "DOTNET_MESSAGE_SENDER_FLOW_UNRESOLVED"));
+        Assert.Contains(result.Diagnostics, item => item.Code == "DOTNET_MESSAGE_DESTINATION_UNRESOLVED");
+        Assert.DoesNotContain(result.Diagnostics, item => item.Code == "DOTNET_MESSAGE_CONTRACT_UNRESOLVED" &&
+            item.Message.Contains("valid.", StringComparison.Ordinal));
+        Assert.Contains(result.Observations.OfType<RelationshipObservation>(), item =>
+            item.Relationship == EdgeKind.UsesContract && item.From.Name == "valid.direct" && item.To.Name == "Event");
+        Assert.Contains(result.Observations.OfType<RelationshipObservation>(), item =>
+            item.Relationship == EdgeKind.UsesContract && item.From.Name == "valid.assignment" && item.To.Name == "BatchEvent");
+    }
+
+    [Fact]
+    public async Task GenericKafkaAndServiceBusContractsRemainUnresolved()
+    {
+        using var temporary = new TemporaryDirectory();
+        await WriteProject(temporary.Path, "Generic.csproj", ExecutableProject("Confluent.Kafka", "Azure.Messaging.ServiceBus"));
+        await WriteProject(temporary.Path, "Flow.cs", """
+            using Azure.Messaging.ServiceBus;
+            using Confluent.Kafka;
+            public sealed class Flow<T>
+            {
+                public void Kafka(IConsumer<string, T> consumer) => consumer.Subscribe("generic.kafka");
+                public async Task Bus(ServiceBusClient client, T value)
+                {
+                    var sender = client.CreateSender("generic.bus");
+                    await sender.SendMessageAsync(new ServiceBusMessage(BinaryData.FromObjectAsJson(value)));
+                }
+            }
+            """);
+
+        var result = await new DotNetScanner().ScanAsync(temporary.Path, CancellationToken.None);
+        var messaging = Messaging(result);
+
+        Assert.Contains(messaging, item => item.To.Name == "generic.kafka" && !item.Properties.ContainsKey("contract"));
+        Assert.Contains(messaging, item => item.To.Name == "generic.bus" && !item.Properties.ContainsKey("contract"));
+        Assert.Equal(2, result.Diagnostics.Count(item => item.Code == "DOTNET_MESSAGE_CONTRACT_UNRESOLVED"));
+        Assert.DoesNotContain(result.Observations.OfType<RelationshipObservation>(), item =>
+            item.Relationship == EdgeKind.UsesContract && item.From.Name.StartsWith("generic.", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task FunctionsDynamicAttributeDestinationFailsClosedWithoutPartialMessagingFacts()
+    {
+        using var temporary = new TemporaryDirectory();
+        await WriteProject(temporary.Path, "Functions.csproj", ExecutableProject(
+            "Microsoft.Azure.Functions.Worker", "Microsoft.Azure.Functions.Worker.Extensions.ServiceBus"));
+        await WriteProject(temporary.Path, "Functions.cs", """
+            using Microsoft.Azure.Functions.Worker;
+            public sealed record Event(string Id);
+            public sealed class Functions
+            {
+                private static readonly string DynamicQueue = "dynamic.queue";
+                [Function("Dynamic")]
+                public void Dynamic([ServiceBusTrigger(DynamicQueue)] Event value) { }
+            }
+            """);
+
+        var result = await new DotNetScanner().ScanAsync(temporary.Path, CancellationToken.None);
+
+        Assert.Empty(Messaging(result));
+        Assert.Contains(result.Diagnostics, item => item.Code == "DOTNET_MESSAGING_COMPILATION_UNAVAILABLE");
+    }
+
+    [Fact]
+    public async Task AmbiguousContractsRemainSeparateAndAreDiagnosedDeterministically()
+    {
+        using var temporary = new TemporaryDirectory();
+        await WriteProject(temporary.Path, "Kafka.csproj", ExecutableProject("Confluent.Kafka"));
+        await WriteProject(temporary.Path, "Flow.cs", """
+            using Confluent.Kafka;
+            public sealed record First(string Id);
+            public sealed record Second(string Id);
+            public sealed class Flow
+            {
+                public void Configure(IConsumer<string, First> first, IConsumer<string, Second> second)
+                { first.Subscribe("ambiguous"); second.Subscribe("ambiguous"); }
+            }
+            """);
+
+        var scanner = new DotNetScanner();
+        var first = await scanner.ScanAsync(temporary.Path, CancellationToken.None);
+        var second = await scanner.ScanAsync(temporary.Path, CancellationToken.None);
+
+        Assert.Contains(first.Diagnostics, item => item.Code == "DOTNET_MESSAGE_CONTRACT_AMBIGUOUS");
+        Assert.Equal(2, first.Observations.OfType<RelationshipObservation>().Count(item =>
+            item.Relationship == EdgeKind.UsesContract && item.From.Name == "ambiguous"));
+        Assert.Equal(ContractJson.WriteObservationBundle(Bundle(first)), ContractJson.WriteObservationBundle(Bundle(second)));
+    }
+
     private static void AssertEndpoint(IEnumerable<EntityObservation> entities, string method, string route) =>
         Assert.Contains(entities, item => item.Entity.Kind == NodeKind.HttpEndpoint &&
             item.Entity.Properties["httpMethod"].GetString() == method && item.Entity.Properties["routeTemplate"].GetString() == route);
+
+    private static RelationshipObservation[] Messaging(DotNetScanResult result) => result.Observations
+        .OfType<RelationshipObservation>().Where(item => item.Relationship is EdgeKind.Publishes or EdgeKind.Subscribes).ToArray();
+
+    private static string ExecutableProject(params string[] packages) => $$"""
+        <Project Sdk="Microsoft.NET.Sdk">
+          <PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net10.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings></PropertyGroup>
+          <ItemGroup>{{string.Join("", packages.Select(package => $"<PackageReference Include=\"{package}\" Version=\"1.0.0\" />"))}}</ItemGroup>
+        </Project>
+        """;
 
     private static Task WriteProject(string root, string relativePath, string content)
     {
@@ -524,7 +934,7 @@ public sealed class DotNetScannerTests
     private static ObservationBundle Bundle(DotNetScanResult result) => new(
         "observations/v1", ObservationSource.Scanner, new string('a', 64),
         new("dotnet-reference", null, "reference", false, new string('b', 64)),
-        [new("archie.dotnet", "1.0.0")], result.Observations, result.Diagnostics, []);
+        [new("archie.dotnet", "1.1.0")], result.Observations, result.Diagnostics, []);
 
     private static string Fixture() => Path.Combine(AppContext.BaseDirectory, "fixtures", "dotnet-reference");
 
