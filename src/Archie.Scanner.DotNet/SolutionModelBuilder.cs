@@ -271,18 +271,24 @@ internal sealed partial class SolutionModelBuilder(DotNetScannerLimits limits)
                         packages.Remove(identity);
                         taintedPackages.Add(identity);
                         diagnostics.Add(Warning("DOTNET_NUGET_COMPILE_ASSETS_UNEVALUATED", file.Path,
-                            $"NuGet package '{include}' has aliases, asset filters, or unsupported metadata; its compile-time availability was omitted.", subject));
+                            "A NuGet package has aliases, asset filters, or unsupported metadata; its compile-time availability was omitted.",
+                            subject, ItemLocation(item)));
                         continue;
                     }
                     var version = ((string?)item.Attribute("Version") ??
                         versionElements.FirstOrDefault()?.Value)?.Trim();
-                    var versionUnknown = !IsLiteral(version ?? string.Empty);
-                    if (versionUnknown) version = null;
+                    var versionUnknown = string.IsNullOrWhiteSpace(version) || !IsLiteral(version);
+                    if (versionUnknown)
+                    {
+                        packages.Remove(identity);
+                        taintedPackages.Add(identity);
+                        diagnostics.Add(Warning("DOTNET_NUGET_VERSION_UNEVALUATED", file.Path,
+                            "A NuGet package has no bounded literal version; imported or central version information was omitted.",
+                            subject, ItemLocation(item)));
+                        continue;
+                    }
                     if (!packageItemsUnknown && !taintedPackages.Contains(identity))
                         packages[identity] = new(identity, version, file.Path, Range(item));
-                    if (version is null)
-                        diagnostics.Add(Warning("DOTNET_NUGET_VERSION_UNEVALUATED", file.Path,
-                            $"NuGet package '{include}' has no bounded literal version; imported or central version information was omitted.", subject));
                 }
                 else if (kind == "FrameworkReference")
                 {
@@ -333,11 +339,15 @@ internal sealed partial class SolutionModelBuilder(DotNetScannerLimits limits)
             outputType is "Exe" or "WinExe" ? "executable" : "library";
         var name = importsUnknown || taintedProperties.Contains("AssemblyName")
             ? Path.GetFileNameWithoutExtension(file.Path) : Value(properties, "AssemblyName", Path.GetFileNameWithoutExtension(file.Path));
+        var candidateSources = repositoryFiles.Where(item => item.Path.EndsWith(".cs", StringComparison.OrdinalIgnoreCase) &&
+                IsWithin(item.FullPath, projectDirectory))
+            .OrderBy(item => item.Path, StringComparer.Ordinal).ToArray();
         return new(
-            $"dotnet:project:{file.Path}", name, file.Path, Range(rootElement), classification,
+            $"dotnet:project:{file.Path}", name, file.Path, file.FullPath, Range(rootElement), classification,
             targetFrameworks,
             packages.Values.OrderBy(item => item.Name, StringComparer.Ordinal).ThenBy(item => item.Version, StringComparer.Ordinal).ToArray(),
-            references.Values.OrderBy(item => item.Include, StringComparer.Ordinal).ToArray(), sources,
+            references.Values.OrderBy(item => item.Include, StringComparer.Ordinal).ToArray(), sources, candidateSources,
+            packageItemsUnknown || taintedPackages.Count > 0,
             !importsUnknown && !taintedProperties.Contains("ImplicitUsings") && Value(properties, "ImplicitUsings", "disable") is "enable" or "true",
             classification is "web" or "worker" or "executable");
     }
@@ -563,8 +573,14 @@ internal sealed partial class SolutionModelBuilder(DotNetScannerLimits limits)
     private static Diagnostic Error(string code, string path, string message) =>
         new($"diagnostic:archie.dotnet:{code.ToLowerInvariant()}:{Stable(path)}", code, "error", message, null);
 
-    private static Diagnostic Warning(string code, string path, string message, string? subject) =>
-        new($"diagnostic:archie.dotnet:{code.ToLowerInvariant()}:{Stable($"{path}:{message}")}", code, "warning", message, subject);
+    private static Diagnostic Warning(string code, string path, string message, string? subject, string? discriminator = null) =>
+        new($"diagnostic:archie.dotnet:{code.ToLowerInvariant()}:{Stable(discriminator is null ? $"{path}:{message}" : $"{path}:{message}:{discriminator}")}",
+            code, "warning", message, subject);
+
+    private static string ItemLocation(XElement item)
+    {
+        return Range(item) is { } range ? $"{range.StartLine}:{range.StartColumn}" : "unknown";
+    }
 
     private static string Stable(string value) => Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(value)))[..12];
 

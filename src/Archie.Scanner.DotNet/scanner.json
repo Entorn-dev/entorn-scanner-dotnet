@@ -1,11 +1,11 @@
 {
   "schemaVersion": "scanner-manifest/v1",
   "id": "archie.dotnet",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "executable": "dotnet",
   "arguments": ["Archie.Scanner.DotNet.dll"],
   "artifactGlobs": ["**/*.sln", "**/*.slnx", "**/*.csproj"],
-  "capabilities": ["dotnet-structure", "aspnet-http", "kafka-messaging", "azure-service-bus", "azure-functions-bindings"],
+  "capabilities": ["dotnet-structure", "aspnet-http", "kafka-messaging", "azure-service-bus", "azure-functions-bindings", "ef-core-data", "configured-http-targets"],
   "configurationSchema": {
     "type": "object",
     "additionalProperties": false

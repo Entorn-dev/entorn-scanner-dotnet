@@ -8,7 +8,7 @@ namespace Archie.Scanner.DotNet;
 public sealed class DotNetScanner(DotNetScannerLimits? limits = null)
 {
     private const string ScannerId = "archie.dotnet";
-    private const string ScannerVersion = "1.1.0";
+    private const string ScannerVersion = "1.2.0";
     private readonly DotNetScannerLimits limits = limits ?? new();
 
     public async Task<DotNetScanResult> ScanAsync(string repositoryRoot, CancellationToken cancellationToken)
@@ -161,6 +161,53 @@ public sealed class DotNetScanner(DotNetScannerLimits? limits = null)
                             ("label", $"uses {detection.Contract}"))));
                 }
             }
+
+            var data = await DataScanner.ScanAsync(project, cancellationToken);
+            diagnostics.AddRange(data.Diagnostics);
+            foreach (var context in data.Contexts)
+            {
+                var candidate = ContextCandidate(project, context);
+                var stable = $"{project.Path}:{context.Type}";
+                observations.Add(Entity($"ef-context:{stable}", candidate, context.Path, context.Range,
+                    "roslyn:semantic-ef-core-dbcontext", Confidence.Confirmed,
+                    Properties(("symbol", context.Symbol))));
+                observations.Add(Relationship($"project-ef-context:{stable}", EdgeKind.Contains,
+                    projectCandidate, candidate, context.Path, context.Range, "roslyn:semantic-ef-core-dbcontext",
+                    Confidence.Confirmed, Properties(("ownership", "project-ef-context"),
+                        ("label", $"contains {candidate.Name}"))));
+            }
+            if (serviceCandidate is null && (data.DataTargets.Count > 0 || data.ExternalTargets.Count > 0))
+            {
+                diagnostics.Add(Diagnostic("DOTNET_RESOURCE_OWNER_UNRESOLVED", "warning",
+                    $"Project '{project.Path}' contains semantically resolved data or external targets but is not a safely classified deployable; no ownership relationships were emitted.",
+                    project.Key, project.Path));
+                continue;
+            }
+            foreach (var detection in data.DataTargets)
+            {
+                var database = DatabaseCandidate(detection);
+                var stable = $"{project.Path}:{detection.Provider}:{detection.ConfigurationKey}:{detection.ContextType}:{detection.Path}:{detection.Range.StartLine}:{detection.Range.StartColumn}";
+                observations.Add(Entity($"database:{stable}", database, detection.Path, detection.Range,
+                    detection.Rule, Confidence.Confirmed, Properties(("symbol", detection.Symbol))));
+                observations.Add(Relationship($"database-dependency:{stable}", EdgeKind.DependsOn,
+                    serviceCandidate!, database, detection.Path, detection.Range, detection.Rule, Confidence.Confirmed,
+                    Properties(("provider", detection.Provider), ("resourceKind", "database"),
+                        ("configurationKey", detection.ConfigurationKey), ("contextType", detection.ContextType),
+                        ("label", $"depends on {database.Name}"))));
+            }
+            foreach (var detection in data.ExternalTargets)
+            {
+                var target = ExternalTargetCandidate(detection);
+                var stable = $"{project.Path}:{detection.Provider}:{detection.Scheme}:{detection.Host}:{detection.Port}:{detection.ConfigurationKey}:{detection.Path}:{detection.Range.StartLine}:{detection.Range.StartColumn}";
+                observations.Add(Entity($"external-target:{stable}", target, detection.Path, detection.Range,
+                    detection.Rule, Confidence.Confirmed, Properties(("symbol", detection.Symbol))));
+                observations.Add(Relationship($"external-call:{stable}", EdgeKind.Calls,
+                    serviceCandidate!, target, detection.Path, detection.Range, detection.Rule, Confidence.Confirmed,
+                    Properties(("provider", detection.Provider), ("resourceKind", detection.ResourceKind),
+                        ("configurationKey", detection.ConfigurationKey), ("scheme", detection.Scheme),
+                        ("host", detection.Host), ("port", detection.Port),
+                        ("label", $"calls {target.Name}"))));
+            }
         }
 
         foreach (var group in observations.OfType<RelationshipObservation>()
@@ -224,6 +271,35 @@ public sealed class DotNetScanner(DotNetScannerLimits? limits = null)
     private static EntityCandidate ContractCandidate(string contract) =>
         Candidate($"dotnet:event-contract:{Uri.EscapeDataString(contract)}", NodeKind.EventContract, contract,
             Resolution.Resolved, Properties(("contractType", contract), ("language", "dotnet")));
+
+    private static EntityCandidate ContextCandidate(ProjectModel project, EfContextDetection context) =>
+        Candidate($"dotnet:ef-context:{Uri.EscapeDataString($"{project.Path}:{context.Type}")}", NodeKind.Component,
+            context.Type.Split('.').Last(), Resolution.Resolved,
+            Properties(("componentKind", "entity-framework-dbcontext"), ("contextType", context.Type),
+                ("ownerProject", project.Path), ("provider", "entity-framework-core")));
+
+    private static EntityCandidate DatabaseCandidate(DataTargetDetection detection) =>
+        new($"dotnet:database:{Stable($"{detection.Provider}:{detection.ConfigurationKey}")}", NodeKind.Database,
+            null, $"{detection.ConfigurationKey.Split(':').Last()} database", Resolution.Resolved,
+            new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["configured-resource"] = $"{detection.Provider}:{Stable(detection.ConfigurationKey)}"
+            },
+            Properties(("provider", detection.Provider), ("resourceKind", "database"),
+                ("configurationKey", detection.ConfigurationKey), ("contextType", detection.ContextType)));
+
+    private static EntityCandidate ExternalTargetCandidate(ExternalTargetDetection detection) =>
+        new($"dotnet:external-service:{Uri.EscapeDataString($"{detection.Provider}:{detection.Scheme}:{detection.Host}:{detection.Port}")}",
+            NodeKind.ExternalService, null,
+            detection.ConfigurationKey is null ? detection.Host : $"{detection.ConfigurationKey.Split(':').First()} external service",
+            Resolution.Resolved,
+            new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["configured-resource"] = $"{detection.Provider}:{detection.Scheme}:{detection.Host}:{detection.Port}"
+            },
+            Properties(("provider", detection.Provider), ("resourceKind", detection.ResourceKind),
+                ("configurationKey", detection.ConfigurationKey), ("scheme", detection.Scheme),
+                ("host", detection.Host), ("port", detection.Port)));
 
     private static EntityCandidate Candidate(
         string key,

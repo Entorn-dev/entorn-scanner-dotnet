@@ -5,7 +5,7 @@ using Archie.Contracts;
 using Archie.Scanner.DotNet;
 
 const string protocolVersion = "scanner/v1";
-var scanner = new ScannerIdentity("archie.dotnet", "1.1.0");
+var scanner = new ScannerIdentity("archie.dotnet", "1.2.0");
 var json = new JsonSerializerOptions(ContractJson.Options) { WriteIndented = false };
 using var cancellation = new CancellationTokenSource();
 using var terminateSignal = OperatingSystem.IsWindows() ? null : PosixSignalRegistration.Create(PosixSignal.SIGTERM, context =>

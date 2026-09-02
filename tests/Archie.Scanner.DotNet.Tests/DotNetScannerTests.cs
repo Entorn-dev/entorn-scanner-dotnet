@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using System.Diagnostics;
 using Archie.Contracts;
 using Archie.Core;
@@ -884,9 +885,927 @@ public sealed class DotNetScannerTests
         Assert.Equal(ContractJson.WriteObservationBundle(Bundle(first)), ContractJson.WriteObservationBundle(Bundle(second)));
     }
 
+    [Fact]
+    public async Task EfCoreContextSqliteConfigurationAndHttpTargetRequireKnownSemanticSymbols()
+    {
+        using var temporary = new TemporaryDirectory();
+        await WriteProject(temporary.Path, "App.csproj", """
+            <Project Sdk="Microsoft.NET.Sdk.Web">
+              <PropertyGroup><TargetFramework>net10.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings></PropertyGroup>
+              <ItemGroup><PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite" Version="10.0.11" /></ItemGroup>
+            </Project>
+            """);
+        await WriteProject(temporary.Path, "Program.cs", """
+            using Microsoft.EntityFrameworkCore;
+            var builder = WebApplication.CreateBuilder(args);
+            builder.Services.AddDbContext<OrdersDbContext>(options =>
+                options.UseSqlite(builder.Configuration.GetConnectionString("Orders")));
+            builder.Services.AddHttpClient(configureClient: client =>
+                client.BaseAddress = new Uri(builder.Configuration["Payment:BaseUrl"] ?? "https://payments.example:8443"),
+                name: "payments");
+            var app = builder.Build();
+            app.Run();
+            public sealed class OrdersDbContext(DbContextOptions<OrdersDbContext> options) : DbContext(options);
+            """);
+        await BuildProject(temporary.Path, "App.csproj");
+
+        var result = await new DotNetScanner().ScanAsync(temporary.Path, CancellationToken.None);
+        var relationships = result.Observations.OfType<RelationshipObservation>().ToArray();
+        var database = Assert.Single(relationships, item => item.Relationship == EdgeKind.DependsOn &&
+            item.To.Kind == NodeKind.Database);
+        var external = Assert.Single(relationships, item => item.Relationship == EdgeKind.Calls &&
+            item.To.Kind == NodeKind.ExternalService);
+
+        Assert.True(result.Succeeded, string.Join(Environment.NewLine, result.Diagnostics.Select(item => item.Message)));
+        Assert.Equal("sqlite", database.Properties["provider"].GetString());
+        Assert.Equal("ConnectionStrings:Orders", database.Properties["configurationKey"].GetString());
+        Assert.Equal("OrdersDbContext", database.Properties["contextType"].GetString());
+        Assert.Equal("http", external.Properties["provider"].GetString());
+        Assert.Equal("Payment:BaseUrl", external.Properties["configurationKey"].GetString());
+        Assert.Equal("payments.example", external.Properties["host"].GetString());
+        Assert.Equal(8443, external.Properties["port"].GetInt32());
+        Assert.Contains(result.Observations.OfType<EntityObservation>(), item =>
+            item.Entity.Properties.TryGetValue("componentKind", out var kind) && kind.GetString() == "entity-framework-dbcontext");
+        Assert.DoesNotContain(result.Observations, item => item is RelationshipObservation relationship &&
+            relationship.Relationship is EdgeKind.ReadsFrom or EdgeKind.WritesTo);
+    }
+
+    [Fact]
+    public async Task SameNameDataAndHttpApisNeverBecomeConfirmedResources()
+    {
+        using var temporary = new TemporaryDirectory();
+        await WriteProject(temporary.Path, "Lookalike.csproj", ExecutableProject());
+        await WriteProject(temporary.Path, "Program.cs", """
+            public static class Program { public static void Main() { } }
+            public class DbContext { }
+            public sealed class FakeContext : DbContext { }
+            public sealed class Options { public Options UseSqlite(string value) => this; }
+            public sealed class Services
+            {
+                public void AddDbContext<T>(Action<Options> configure) => configure(new());
+                public void AddHttpClient(string name, Action<FakeHttpClient> configure) => configure(new());
+            }
+            public sealed class FakeHttpClient { public Uri? BaseAddress { get; set; } }
+            public sealed class Flow
+            {
+                public void Configure(Services services)
+                {
+                    services.AddDbContext<FakeContext>(options => options.UseSqlite("Data Source=lookalike.db"));
+                    services.AddHttpClient("fake", client => client.BaseAddress = new Uri("https://lookalike.invalid"));
+                }
+            }
+            """);
+        await BuildProject(temporary.Path, "Lookalike.csproj");
+
+        var result = await new DotNetScanner().ScanAsync(temporary.Path, CancellationToken.None);
+
+        Assert.DoesNotContain(result.Observations.OfType<EntityObservation>(), item =>
+            item.Entity.Kind is NodeKind.Database or NodeKind.ExternalService ||
+            item.Entity.Properties.ContainsKey("componentKind"));
+        Assert.DoesNotContain(result.Observations.OfType<RelationshipObservation>(), item =>
+            item.To.Kind is NodeKind.Database or NodeKind.ExternalService);
+    }
+
+    [Fact]
+    public async Task DynamicSecretMalformedAliasedAndControlFlowHttpTargetsFailClosed()
+    {
+        using var temporary = new TemporaryDirectory();
+        await WriteProject(temporary.Path, "Api.csproj", "<Project Sdk=\"Microsoft.NET.Sdk.Web\"><PropertyGroup><TargetFramework>net10.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings></PropertyGroup></Project>");
+        await WriteProject(temporary.Path, "Program.cs", """
+            var builder = WebApplication.CreateBuilder(args);
+            builder.Services.AddHttpClient("dynamic", client => client.BaseAddress = new Uri(builder.Configuration["Dynamic:BaseUrl"]!));
+            builder.Services.AddHttpClient("userinfo", client => client.BaseAddress = new Uri("https://synthetic-user:synthetic-pass@secret.invalid"));
+            builder.Services.AddHttpClient("query", client => client.BaseAddress = new Uri("https://secret.invalid/?token=synthetic-token"));
+            builder.Services.AddHttpClient("malformed", client => client.BaseAddress = new Uri("not a uri"));
+            builder.Services.AddHttpClient("sensitive-key", client => client.BaseAddress = new Uri(builder.Configuration["Payment:ApiPassword"] ?? "https://password-key.invalid"));
+            builder.Services.AddHttpClient("api-key", client => client.BaseAddress = new Uri(builder.Configuration["Payment:Api_Key"] ?? "https://api-key.invalid"));
+            builder.Services.AddHttpClient("authorization", client => client.BaseAddress = new Uri(builder.Configuration["Payment:Authorization"] ?? "https://authorization.invalid"));
+            builder.Services.AddHttpClient("cookie", client => client.BaseAddress = new Uri(builder.Configuration["Payment:Cookie"] ?? "https://cookie.invalid"));
+            builder.Services.AddHttpClient("private-key", client => client.BaseAddress = new Uri(builder.Configuration["Payment:Private.Key"] ?? "https://private-key.invalid"));
+            var alias = builder.Configuration;
+            builder.Services.AddHttpClient("alias", client => client.BaseAddress = new Uri(alias["Alias:BaseUrl"] ?? "https://alias.invalid"));
+            builder.Services.AddHttpClient("control", client => { if (DateTime.UtcNow.Ticks > 0) client.BaseAddress = new Uri("https://control.invalid"); });
+            builder.Services.AddHttpClient("reassigned", client => { client.BaseAddress = new Uri("https://first.invalid"); client.BaseAddress = new Uri("https://second.invalid"); });
+            var app = builder.Build();
+            app.Run();
+            """);
+        await BuildProject(temporary.Path, "Api.csproj");
+
+        var result = await new DotNetScanner().ScanAsync(temporary.Path, CancellationToken.None);
+        var serialized = JsonSerializer.Serialize(result, ContractJson.Options);
+
+        Assert.DoesNotContain(result.Observations.OfType<RelationshipObservation>(), item => item.To.Kind == NodeKind.ExternalService);
+        Assert.Contains(result.Diagnostics, item => item.Code == "DOTNET_EXTERNAL_TARGET_UNRESOLVED");
+        Assert.Contains(result.Diagnostics, item => item.Code == "DOTNET_EXTERNAL_TARGET_MALFORMED");
+        Assert.Contains(result.Diagnostics, item => item.Code == "DOTNET_EXTERNAL_TARGET_SENSITIVE_OR_UNSUPPORTED");
+        Assert.DoesNotContain("synthetic-pass", serialized, StringComparison.Ordinal);
+        Assert.DoesNotContain("synthetic-token", serialized, StringComparison.Ordinal);
+        Assert.DoesNotContain("secret.invalid", serialized, StringComparison.Ordinal);
+        Assert.DoesNotContain("Payment:Api_Key", serialized, StringComparison.Ordinal);
+        Assert.DoesNotContain("Payment:Authorization", serialized, StringComparison.Ordinal);
+        Assert.DoesNotContain("Payment:Cookie", serialized, StringComparison.Ordinal);
+        Assert.DoesNotContain("Payment:Private.Key", serialized, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task NamedAndTypedHttpClientRegistrationsDeduplicateOrFailClosedBySemanticIdentity()
+    {
+        using var temporary = new TemporaryDirectory();
+        await WriteProject(temporary.Path, "Api.csproj", "<Project Sdk=\"Microsoft.NET.Sdk.Web\"><PropertyGroup><TargetFramework>net10.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings></PropertyGroup></Project>");
+        await WriteProject(temporary.Path, "Program.cs", """
+            var builder = WebApplication.CreateBuilder(args);
+            builder.Services.AddHttpClient("same", client => client.BaseAddress = new Uri("https://same.example"));
+            builder.Services.AddHttpClient(configureClient: client => client.BaseAddress = new Uri("https://same.example"), name: "same");
+            builder.Services.AddHttpClient("payments", client => client.BaseAddress = new Uri("https://first.example"));
+            builder.Services.AddHttpClient(name: "payments", configureClient: client => client.BaseAddress = new Uri("https://second.example"));
+            builder.Services.AddHttpClient<PaymentClient>(client => client.BaseAddress = new Uri("https://typed.example"));
+            builder.Services.AddHttpClient("typed-separate", client => client.BaseAddress = new Uri("https://named.example"));
+            builder.Services.AddHttpClient<IPartnerClient, PartnerOne>(client => client.BaseAddress = new Uri("https://implementation-one.example"));
+            builder.Services.AddHttpClient<IPartnerClient, PartnerTwo>(client => client.BaseAddress = new Uri("https://implementation-two.example"));
+            builder.Services.AddHttpClient<IShippingClient, ShippingClient>(client => client.BaseAddress = new Uri("https://shipping.example"));
+            builder.Services.AddHttpClient<IShippingClient, ShippingClient>(client => client.BaseAddress = new Uri("https://shipping.example"));
+            var app = builder.Build();
+            app.Run();
+            public sealed class PaymentClient(HttpClient client) { public HttpClient Client { get; } = client; }
+            public interface IPartnerClient { }
+            public sealed class PartnerOne(HttpClient client) : IPartnerClient { public HttpClient Client { get; } = client; }
+            public sealed class PartnerTwo(HttpClient client) : IPartnerClient { public HttpClient Client { get; } = client; }
+            public interface IShippingClient { }
+            public sealed class ShippingClient(HttpClient client) : IShippingClient { public HttpClient Client { get; } = client; }
+            """);
+        await BuildProject(temporary.Path, "Api.csproj");
+
+        var result = await new DotNetScanner().ScanAsync(temporary.Path, CancellationToken.None);
+        var external = result.Observations.OfType<RelationshipObservation>()
+            .Where(item => item.To.Kind == NodeKind.ExternalService).ToArray();
+
+        Assert.Equal(4, external.Length);
+        Assert.Equal(["named.example", "same.example", "shipping.example", "typed.example"], external
+            .Select(item => item.Properties["host"].GetString()!).Order(StringComparer.Ordinal).ToArray());
+        Assert.Equal(2, result.Diagnostics.Count(item => item.Code == "DOTNET_EXTERNAL_TARGET_AMBIGUOUS"));
+        Assert.DoesNotContain(external, item => item.Properties["host"].GetString() is
+            "first.example" or "second.example" or "implementation-one.example" or "implementation-two.example");
+    }
+
+    [Fact]
+    public async Task ConflictingEfContextsAndConfigurationTargetsAreDiagnosedAndOmitted()
+    {
+        using var temporary = new TemporaryDirectory();
+        await WriteProject(temporary.Path, "Data.csproj", """
+            <Project Sdk="Microsoft.NET.Sdk">
+              <PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net10.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings></PropertyGroup>
+              <ItemGroup><PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite" Version="10.0.11" /></ItemGroup>
+            </Project>
+            """);
+        await WriteProject(temporary.Path, "Program.cs", """
+            using Microsoft.EntityFrameworkCore;
+            using Microsoft.Extensions.Configuration;
+            using Microsoft.Extensions.DependencyInjection;
+            public static class Program
+            {
+                public static void Main() { }
+                public static void Configure(IServiceCollection services, IConfiguration configuration)
+                {
+                    services.AddDbContext<ChangingContext>(options => options.UseSqlite(configuration.GetConnectionString("First")));
+                    services.AddDbContext<ChangingContext>(options => options.UseSqlite(configuration.GetConnectionString("Second")));
+                    services.AddDbContext<SharedContextOne>(options => options.UseSqlite(configuration.GetConnectionString("Shared")));
+                    services.AddDbContext<SharedContextTwo>(options => options.UseSqlite(configuration.GetConnectionString("Shared")));
+                }
+            }
+            public sealed class ChangingContext(DbContextOptions<ChangingContext> options) : DbContext(options);
+            public sealed class SharedContextOne(DbContextOptions<SharedContextOne> options) : DbContext(options);
+            public sealed class SharedContextTwo(DbContextOptions<SharedContextTwo> options) : DbContext(options);
+            """);
+        await BuildProject(temporary.Path, "Data.csproj");
+
+        var result = await new DotNetScanner().ScanAsync(temporary.Path, CancellationToken.None);
+
+        Assert.DoesNotContain(result.Observations.OfType<RelationshipObservation>(), item => item.To.Kind == NodeKind.Database);
+        Assert.Equal(2, result.Diagnostics.Count(item => item.Code == "DOTNET_DATA_CONFIGURATION_AMBIGUOUS"));
+    }
+
+    [Fact]
+    public async Task UnsupportedProviderAndConfigurationFormsEmitDiagnosticsWithoutDatabaseFacts()
+    {
+        using var temporary = new TemporaryDirectory();
+        await WriteProject(temporary.Path, "Data.csproj", """
+            <Project Sdk="Microsoft.NET.Sdk">
+              <PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net10.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings></PropertyGroup>
+              <ItemGroup><PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite" Version="10.0.11" /></ItemGroup>
+            </Project>
+            """);
+        await WriteProject(temporary.Path, "Program.cs", """
+            using Microsoft.EntityFrameworkCore;
+            using Microsoft.Extensions.Configuration;
+            using Microsoft.Extensions.DependencyInjection;
+            public static class Program
+            {
+                public static void Main() { }
+                public static void Configure(IServiceCollection services, IConfiguration configuration)
+                {
+                    services.AddDbContext<DirectContext>(options => options.UseSqlite("Data Source=synthetic-password.db"));
+                    services.AddDbContext<DynamicContext>(options => options.UseSqlite(configuration["Database:Dynamic"]!));
+                    services.AddDbContext<FallbackContext>(options => options.UseSqlite(configuration.GetConnectionString("Orders") ?? Environment.GetEnvironmentVariable("SYNTHETIC_CONNECTION_FALLBACK")));
+                    services.AddDbContext<AmbiguousContext>(options => { options.UseSqlite(configuration.GetConnectionString("One")); options.UseSqlite(configuration.GetConnectionString("Two")); });
+                    services.AddDbContext<WrappedContext>(options => ConfigureProvider(options, configuration));
+                }
+                private static void ConfigureProvider(DbContextOptionsBuilder options, IConfiguration configuration) =>
+                    options.UseSqlite(configuration.GetConnectionString("Wrapped"));
+            }
+            public sealed class DirectContext(DbContextOptions<DirectContext> options) : DbContext(options);
+            public sealed class DynamicContext(DbContextOptions<DynamicContext> options) : DbContext(options);
+            public sealed class FallbackContext(DbContextOptions<FallbackContext> options) : DbContext(options);
+            public sealed class AmbiguousContext(DbContextOptions<AmbiguousContext> options) : DbContext(options);
+            public sealed class WrappedContext(DbContextOptions<WrappedContext> options) : DbContext(options);
+            """);
+        await BuildProject(temporary.Path, "Data.csproj");
+
+        var result = await new DotNetScanner().ScanAsync(temporary.Path, CancellationToken.None);
+        var serialized = JsonSerializer.Serialize(result, ContractJson.Options);
+
+        Assert.DoesNotContain(result.Observations.OfType<RelationshipObservation>(), item => item.To.Kind == NodeKind.Database);
+        Assert.Contains(result.Diagnostics, item => item.Code == "DOTNET_DATA_CONFIGURATION_UNRESOLVED");
+        Assert.Contains(result.Diagnostics, item => item.Code == "DOTNET_DATA_PROVIDER_AMBIGUOUS");
+        Assert.Contains(result.Diagnostics, item => item.Code == "DOTNET_DATA_PROVIDER_UNRESOLVED");
+        Assert.DoesNotContain("synthetic-password", serialized, StringComparison.Ordinal);
+        Assert.DoesNotContain("SYNTHETIC_CONNECTION_FALLBACK", serialized, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task EfConnectionStringRequiresTheInvocationAsTheExactArgumentSyntax()
+    {
+        using var temporary = new TemporaryDirectory();
+        await WriteProject(temporary.Path, "Data.csproj", """
+            <Project Sdk="Microsoft.NET.Sdk">
+              <PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net10.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings></PropertyGroup>
+              <ItemGroup><PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite" Version="10.0.11" /></ItemGroup>
+            </Project>
+            """);
+        await WriteProject(temporary.Path, "Program.cs", """
+            using Microsoft.EntityFrameworkCore;
+            using Microsoft.Extensions.Configuration;
+            using Microsoft.Extensions.DependencyInjection;
+            public static class Program
+            {
+                public static void Main() { }
+                public static void Configure(IServiceCollection services, IConfiguration configuration)
+                {
+                    services.AddDbContext<DirectContext>(options => options.UseSqlite(configuration.GetConnectionString("Direct")));
+                    services.AddDbContext<ParenthesizedContext>(options => options.UseSqlite((configuration.GetConnectionString("Parenthesized"))));
+                    services.AddDbContext<SuppressedContext>(options => options.UseSqlite(configuration.GetConnectionString("Suppressed")!));
+                    services.AddDbContext<CastContext>(options => options.UseSqlite((string)configuration.GetConnectionString("Cast")!));
+                }
+            }
+            public sealed class DirectContext(DbContextOptions<DirectContext> options) : DbContext(options);
+            public sealed class ParenthesizedContext(DbContextOptions<ParenthesizedContext> options) : DbContext(options);
+            public sealed class SuppressedContext(DbContextOptions<SuppressedContext> options) : DbContext(options);
+            public sealed class CastContext(DbContextOptions<CastContext> options) : DbContext(options);
+            """);
+        await BuildProject(temporary.Path, "Data.csproj");
+
+        var result = await new DotNetScanner().ScanAsync(temporary.Path, CancellationToken.None);
+        var databases = result.Observations.OfType<RelationshipObservation>()
+            .Where(item => item.To.Kind == NodeKind.Database).ToArray();
+
+        var direct = Assert.Single(databases);
+        Assert.Equal("ConnectionStrings:Direct", direct.Properties["configurationKey"].GetString());
+        Assert.Equal(3, result.Diagnostics.Count(item => item.Code == "DOTNET_DATA_CONFIGURATION_UNRESOLVED"));
+        Assert.DoesNotContain(databases, item => item.Properties["configurationKey"].GetString() is
+            "ConnectionStrings:Parenthesized" or "ConnectionStrings:Suppressed" or "ConnectionStrings:Cast");
+    }
+
+    [Fact]
+    public async Task MissingAndCompileExcludedEfDependenciesProduceNoStaleFacts()
+    {
+        foreach (var package in new[]
+                 {
+                     string.Empty,
+                     "<ItemGroup><PackageReference Include=\"Microsoft.EntityFrameworkCore.Sqlite\" Version=\"10.0.11\" ExcludeAssets=\"compile\" /></ItemGroup>"
+                 })
+        {
+            using var temporary = new TemporaryDirectory();
+            await WriteProject(temporary.Path, "Missing.csproj", $$"""
+                <Project Sdk="Microsoft.NET.Sdk">
+                  <PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net10.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings></PropertyGroup>
+                  {{package}}
+                </Project>
+                """);
+            await WriteProject(temporary.Path, "Program.cs", """
+                using Microsoft.EntityFrameworkCore;
+                public static class Program { public static void Main() { } }
+                public sealed class MissingContext : DbContext { }
+                """);
+
+            var result = await new DotNetScanner().ScanAsync(temporary.Path, CancellationToken.None);
+
+            Assert.DoesNotContain(result.Observations.OfType<EntityObservation>(), item =>
+                item.Entity.Kind == NodeKind.Database || item.Entity.Properties.ContainsKey("componentKind"));
+            Assert.DoesNotContain(result.Observations.OfType<RelationshipObservation>(), item => item.To.Kind == NodeKind.Database);
+            Assert.Contains(result.Diagnostics, item => item.Code is "DOTNET_DATA_COMPILATION_UNAVAILABLE" or "DOTNET_NUGET_COMPILE_ASSETS_UNEVALUATED");
+        }
+    }
+
+    [Fact]
+    public async Task TargetPreprocessorStateFailsClosedEvenWhenTheTargetBuildExcludesThePhantomRoute()
+    {
+        using var temporary = new TemporaryDirectory();
+        await WriteProject(temporary.Path, "Api.csproj", "<Project Sdk=\"Microsoft.NET.Sdk.Web\"><PropertyGroup><TargetFramework>net10.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings></PropertyGroup></Project>");
+        await WriteProject(temporary.Path, "Program.cs", """
+            var builder = WebApplication.CreateBuilder(args);
+            #if NET10_0
+            builder.Services.AddHttpClient("active", client => client.BaseAddress = new Uri("https://active.example"));
+            #else
+            builder.Services.AddHttpClient("phantom", client => client.BaseAddress = new Uri("https://phantom.example"));
+            #endif
+            var app = builder.Build();
+            app.Run();
+            """);
+
+        var build = await RunDotNet(temporary.Path, "build", "Api.csproj", "--nologo");
+        var result = await new DotNetScanner().ScanAsync(temporary.Path, CancellationToken.None);
+        var worker = await RunWorker(temporary.Path);
+
+        Assert.Equal(0, build.ExitCode);
+        Assert.Contains(result.Diagnostics, item => item.Code == "DOTNET_DATA_COMPILATION_UNAVAILABLE");
+        Assert.DoesNotContain(result.Observations.OfType<RelationshipObservation>(), item => item.To.Kind == NodeKind.ExternalService);
+        Assert.True(worker.Output.Contains("DOTNET_DATA_COMPILATION_UNAVAILABLE", StringComparison.Ordinal), worker.Output + worker.Error);
+        Assert.DoesNotContain("phantom.example", worker.Output + worker.Error, StringComparison.Ordinal);
+        Assert.DoesNotContain("active.example", worker.Output + worker.Error, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task FailedTargetLanguageCompilationCannotAuthorizeLatestLanguageFacts()
+    {
+        using var temporary = new TemporaryDirectory();
+        await WriteProject(temporary.Path, "Api.csproj", """
+            <Project Sdk="Microsoft.NET.Sdk.Web">
+              <PropertyGroup><TargetFramework>net10.0</TargetFramework><LangVersion>7.3</LangVersion><ImplicitUsings>enable</ImplicitUsings></PropertyGroup>
+            </Project>
+            """);
+        await WriteProject(temporary.Path, "Program.cs", """
+            var builder = WebApplication.CreateBuilder(args);
+            builder.Services.AddHttpClient("phantom", client => client.BaseAddress = new Uri("https://language-phantom.example"));
+            var app = builder.Build();
+            app.Run();
+            """);
+
+        var build = await RunDotNet(temporary.Path, "build", "Api.csproj", "--nologo");
+        var worker = await RunWorker(temporary.Path);
+
+        Assert.NotEqual(0, build.ExitCode);
+        Assert.Contains("CS8370", build.Output + build.Error, StringComparison.Ordinal);
+        Assert.Contains("DOTNET_DATA_COMPILATION_UNAVAILABLE", worker.Output, StringComparison.Ordinal);
+        Assert.DoesNotContain("language-phantom.example", worker.Output + worker.Error, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task StrictAssetsProvenanceRejectsMissingMalformedAliasedAndMismatchedMembers()
+    {
+        using var temporary = new TemporaryDirectory();
+        await WriteProject(temporary.Path, "Api.csproj", "<Project Sdk=\"Microsoft.NET.Sdk.Web\"><PropertyGroup><TargetFramework>net10.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings></PropertyGroup><ItemGroup><PackageReference Include=\"Microsoft.EntityFrameworkCore.Sqlite\" Version=\"10.0.11\" /></ItemGroup></Project>");
+        await WriteProject(temporary.Path, "Program.cs", """
+            var builder = WebApplication.CreateBuilder(args);
+            builder.Services.AddHttpClient("strict", client => client.BaseAddress = new Uri("https://strict-assets.example"));
+            var app = builder.Build();
+            app.Run();
+            """);
+        await BuildProject(temporary.Path, "Api.csproj");
+        var assetsPath = Path.Combine(temporary.Path, "obj", "project.assets.json");
+        var original = JsonNode.Parse(await File.ReadAllTextAsync(assetsPath))!.AsObject();
+        foreach (var mutation in new[]
+                 {
+                     "missing-libraries", "malformed-libraries", "missing-config-paths", "malformed-config-paths",
+                     "empty-config-paths", "target-case-alias", "duplicate-library-identity", "target-library-mismatch"
+                 })
+        {
+            var assets = original.DeepClone().AsObject();
+            var restore = assets["project"]!["restore"]!.AsObject();
+            var targets = assets["targets"]!.AsObject();
+            var libraries = assets["libraries"]!.AsObject();
+            switch (mutation)
+            {
+                case "missing-libraries": assets.Remove("libraries"); break;
+                case "malformed-libraries": assets["libraries"] = new JsonArray(); break;
+                case "missing-config-paths": restore.Remove("configFilePaths"); break;
+                case "malformed-config-paths": restore["configFilePaths"] = "not-an-array"; break;
+                case "empty-config-paths": restore["configFilePaths"] = new JsonArray(); break;
+                case "target-case-alias": targets["NET10.0"] = targets["net10.0"]!.DeepClone(); break;
+                case "duplicate-library-identity":
+                    var library = libraries.First();
+                    libraries[library.Key.ToUpperInvariant()] = library.Value!.DeepClone();
+                    break;
+                default:
+                    var target = targets["net10.0"]!.AsObject();
+                    var entry = target.First();
+                    target.Remove(entry.Key);
+                    target[entry.Key.ToUpperInvariant()] = entry.Value;
+                    break;
+            }
+            await File.WriteAllTextAsync(assetsPath, assets.ToJsonString());
+            var worker = await RunWorker(temporary.Path);
+            Assert.Contains("DOTNET_DATA_COMPILATION_UNAVAILABLE", worker.Output, StringComparison.Ordinal);
+            Assert.DoesNotContain("strict-assets.example", worker.Output + worker.Error, StringComparison.Ordinal);
+        }
+    }
+
+    [Theory]
+    [InlineData("future-output")]
+    [InlineData("backdated-source")]
+    [InlineData("new-source")]
+    public async Task CurrentWarningsAsErrorsCannotBeBypassedWithManipulatedTimestamps(string mutation)
+    {
+        using var temporary = new TemporaryDirectory();
+        await WriteProject(temporary.Path, "Api.csproj", """
+            <Project Sdk="Microsoft.NET.Sdk.Web">
+              <PropertyGroup><TargetFramework>net10.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable><TreatWarningsAsErrors>true</TreatWarningsAsErrors></PropertyGroup>
+            </Project>
+            """);
+        const string valid = """
+            var builder = WebApplication.CreateBuilder(args);
+            builder.Services.AddHttpClient("current", client => client.BaseAddress = new Uri("https://never-built.example"));
+            var app = builder.Build();
+            app.Run();
+            """;
+        await WriteProject(temporary.Path, "Program.cs", valid);
+        await BuildProject(temporary.Path, "Api.csproj");
+        var invalid = """
+            string? maybe = null;
+            string current = maybe;
+            var builder = WebApplication.CreateBuilder(args);
+            builder.Services.AddHttpClient("current", client => client.BaseAddress = new Uri("https://never-built.example"));
+            var app = builder.Build();
+            app.Run();
+            """;
+        if (mutation == "new-source") await WriteProject(temporary.Path, "Later.cs",
+            "public static class Later { public static void Check() { string? maybe = null; string current = maybe; } }");
+        else await WriteProject(temporary.Path, "Program.cs", invalid);
+
+        var build = await RunDotNet(temporary.Path, "build", "Api.csproj", "--no-restore", "--nologo");
+        var referenceAssembly = Path.Combine(temporary.Path, "obj", "Debug", "net10.0", "ref", "Api.dll");
+        if (File.Exists(referenceAssembly)) File.SetLastWriteTimeUtc(referenceAssembly, DateTime.UtcNow.AddDays(1));
+        if (mutation == "backdated-source") File.SetLastWriteTimeUtc(Path.Combine(temporary.Path, "Program.cs"), DateTime.UtcNow.AddDays(-1));
+        var worker = await RunWorker(temporary.Path);
+
+        Assert.NotEqual(0, build.ExitCode);
+        Assert.Contains("CS8600", build.Output + build.Error, StringComparison.Ordinal);
+        Assert.Contains("DOTNET_DATA_COMPILATION_UNAVAILABLE", worker.Output, StringComparison.Ordinal);
+        Assert.DoesNotContain("never-built.example", worker.Output + worker.Error, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("<ItemGroup><Analyzer Include=\"repository-analyzer.dll\" /></ItemGroup>")]
+    [InlineData("<PropertyGroup><EmitCompilerGeneratedFiles>true</EmitCompilerGeneratedFiles></PropertyGroup>")]
+    public async Task DeclaredAnalyzerOrGeneratedSourceRequirementsFailClosedWithoutExecution(string declaration)
+    {
+        using var temporary = new TemporaryDirectory();
+        await WriteProject(temporary.Path, "Api.csproj", $$"""
+            <Project Sdk="Microsoft.NET.Sdk.Web">
+              <PropertyGroup><TargetFramework>net10.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings></PropertyGroup>
+              {{declaration}}
+            </Project>
+            """);
+        await WriteProject(temporary.Path, "Program.cs", """
+            var builder = WebApplication.CreateBuilder(args);
+            builder.Services.AddHttpClient("unsupported", client => client.BaseAddress = new Uri("https://unsupported-compiler-input.example"));
+            var app = builder.Build();
+            app.Run();
+            """);
+        var restore = await RunDotNet(temporary.Path, "restore", "Api.csproj", "--nologo");
+
+        var worker = await RunWorker(temporary.Path);
+
+        Assert.Equal(0, restore.ExitCode);
+        Assert.Contains("DOTNET_DATA_COMPILATION_UNAVAILABLE", worker.Output, StringComparison.Ordinal);
+        Assert.DoesNotContain("unsupported-compiler-input.example", worker.Output + worker.Error, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task AnalyzerPackageReferenceMetadataTaintsSliceEightCompilation(bool analyzerMetadata)
+    {
+        using var temporary = new TemporaryDirectory();
+        var metadata = analyzerMetadata ? " OutputItemType=\"Analyzer\" ReferenceOutputAssembly=\"false\"" : string.Empty;
+        await WriteProject(temporary.Path, "Api.csproj", $$"""
+            <Project Sdk="Microsoft.NET.Sdk.Web">
+              <PropertyGroup><TargetFramework>net10.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings></PropertyGroup>
+              <ItemGroup><PackageReference Include="Microsoft.EntityFrameworkCore.Analyzers" Version="10.0.11"{{metadata}} /></ItemGroup>
+            </Project>
+            """);
+        await WriteProject(temporary.Path, "Program.cs", """
+            var builder = WebApplication.CreateBuilder(args);
+            builder.Services.AddHttpClient("analyzer", client => client.BaseAddress = new Uri("https://analyzer-package.example"));
+            var app = builder.Build();
+            app.Run();
+            """);
+        var restore = await RunDotNet(temporary.Path, "restore", "Api.csproj", "--nologo");
+
+        var worker = await RunWorker(temporary.Path);
+        var output = worker.Output + worker.Error;
+
+        Assert.Equal(0, restore.ExitCode);
+        Assert.Equal(0, worker.ExitCode);
+        if (analyzerMetadata)
+        {
+            Assert.Contains("DOTNET_NUGET_COMPILE_ASSETS_UNEVALUATED", output, StringComparison.Ordinal);
+            Assert.Contains("DOTNET_DATA_COMPILATION_UNAVAILABLE", output, StringComparison.Ordinal);
+            Assert.DoesNotContain("analyzer-package.example", output, StringComparison.Ordinal);
+        }
+        else
+        {
+            Assert.DoesNotContain("DOTNET_DATA_COMPILATION_UNAVAILABLE", output, StringComparison.Ordinal);
+            Assert.Contains("analyzer-package.example", output, StringComparison.Ordinal);
+        }
+    }
+
+    [Fact]
+    public async Task UnsupportedPackageMetadataCannotCrossRawWorkerProtocol()
+    {
+        const string hostileIdentity = "SYNTHETIC_TOKEN_/home/private/repository";
+        using var temporary = new TemporaryDirectory();
+        await WriteProject(temporary.Path, "Api.csproj", $$"""
+            <Project Sdk="Microsoft.NET.Sdk.Web">
+              <PropertyGroup><TargetFramework>net10.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings></PropertyGroup>
+              <ItemGroup><PackageReference Include="{{hostileIdentity}}" Version="1.0.0" OutputItemType="Analyzer" ReferenceOutputAssembly="false" /></ItemGroup>
+            </Project>
+            """);
+        await WriteProject(temporary.Path, "Program.cs", """
+            var builder = WebApplication.CreateBuilder(args);
+            builder.Services.AddHttpClient("blocked", client => client.BaseAddress = new Uri("https://blocked-package.example"));
+            """);
+
+        var worker = await RunWorker(temporary.Path);
+        var output = worker.Ready + worker.Output + worker.Error;
+        var messages = worker.Output.Split('\n', StringSplitOptions.RemoveEmptyEntries)
+            .Select(line => JsonSerializer.Deserialize<ProtocolMessage>(line, ContractJson.Options)!).ToArray();
+
+        Assert.Equal(0, worker.ExitCode);
+        Assert.Contains("DOTNET_NUGET_COMPILE_ASSETS_UNEVALUATED", output, StringComparison.Ordinal);
+        Assert.Contains("DOTNET_DATA_COMPILATION_UNAVAILABLE", output, StringComparison.Ordinal);
+        Assert.DoesNotContain(messages.OfType<ObservationMessage>(), message =>
+            message.Observation is RelationshipObservation relationship &&
+            relationship.To.Kind is NodeKind.Database or NodeKind.ExternalService);
+        Assert.Equal(messages.OfType<ObservationMessage>().Count(),
+            Assert.Single(messages.OfType<CompletedMessage>()).Summary.ObservationCount);
+        Assert.DoesNotContain("SYNTHETIC_TOKEN_", output, StringComparison.Ordinal);
+        Assert.DoesNotContain("/home/private/repository", output, StringComparison.Ordinal);
+        Assert.DoesNotContain("blocked-package.example", output, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task UnresolvedPackageVersionCannotCrossRawWorkerProtocol()
+    {
+        const string hostileIdentity = "SYNTHETIC_VERSION_TOKEN_/home/private/version";
+        using var temporary = new TemporaryDirectory();
+        await WriteProject(temporary.Path, "Api.csproj", $$"""
+            <Project Sdk="Microsoft.NET.Sdk.Web">
+              <PropertyGroup><TargetFramework>net10.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings></PropertyGroup>
+              <ItemGroup><PackageReference Include="{{hostileIdentity}}" Version="$(UnresolvedVersion)" /></ItemGroup>
+            </Project>
+            """);
+        await WriteProject(temporary.Path, "Program.cs", """
+            var builder = WebApplication.CreateBuilder(args);
+            builder.Services.AddHttpClient("blocked", client => client.BaseAddress = new Uri("https://blocked-version.example"));
+            """);
+
+        var worker = await RunWorker(temporary.Path);
+        var output = worker.Ready + worker.Output + worker.Error;
+        var messages = worker.Output.Split('\n', StringSplitOptions.RemoveEmptyEntries)
+            .Select(line => JsonSerializer.Deserialize<ProtocolMessage>(line, ContractJson.Options)!).ToArray();
+
+        Assert.Equal(0, worker.ExitCode);
+        Assert.Contains("DOTNET_NUGET_VERSION_UNEVALUATED", output, StringComparison.Ordinal);
+        Assert.Contains("DOTNET_DATA_COMPILATION_UNAVAILABLE", output, StringComparison.Ordinal);
+        Assert.DoesNotContain(messages.OfType<ObservationMessage>(), message =>
+            message.Observation is RelationshipObservation relationship &&
+            relationship.To.Kind is NodeKind.Database or NodeKind.ExternalService);
+        Assert.DoesNotContain("SYNTHETIC_VERSION_TOKEN_", output, StringComparison.Ordinal);
+        Assert.DoesNotContain("/home/private/version", output, StringComparison.Ordinal);
+        Assert.DoesNotContain("blocked-version.example", output, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData(" Version=\"   \"")]
+    public async Task MissingOrBlankPackageVersionCannotCrossRawWorkerProtocol(string versionAttribute)
+    {
+        const string hostileIdentity = "SYNTHETIC_MISSING_VERSION_/home/private/missing";
+        using var temporary = new TemporaryDirectory();
+        await WriteProject(temporary.Path, "Api.csproj", $$"""
+            <Project Sdk="Microsoft.NET.Sdk.Web">
+              <PropertyGroup><TargetFramework>net10.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings></PropertyGroup>
+              <ItemGroup><PackageReference Include="{{hostileIdentity}}"{{versionAttribute}} /></ItemGroup>
+            </Project>
+            """);
+        await WriteProject(temporary.Path, "Program.cs", """
+            var builder = WebApplication.CreateBuilder(args);
+            builder.Services.AddHttpClient("blocked", client => client.BaseAddress = new Uri("https://missing-version.example"));
+            """);
+
+        var worker = await RunWorker(temporary.Path);
+        var output = worker.Ready + worker.Output + worker.Error;
+        var messages = worker.Output.Split('\n', StringSplitOptions.RemoveEmptyEntries)
+            .Select(line => JsonSerializer.Deserialize<ProtocolMessage>(line, ContractJson.Options)!).ToArray();
+
+        Assert.Equal(0, worker.ExitCode);
+        Assert.Contains("DOTNET_NUGET_VERSION_UNEVALUATED", output, StringComparison.Ordinal);
+        Assert.Contains("DOTNET_DATA_COMPILATION_UNAVAILABLE", output, StringComparison.Ordinal);
+        Assert.DoesNotContain(messages.OfType<ObservationMessage>(), message =>
+            IsPackageOrSliceEightObservation(message.Observation));
+        Assert.DoesNotContain("SYNTHETIC_MISSING_VERSION_", output, StringComparison.Ordinal);
+        Assert.DoesNotContain("/home/private/missing", output, StringComparison.Ordinal);
+        Assert.DoesNotContain("missing-version.example", output, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData(" Version=\"$(SYNTHETIC_VERSION_/home/private/version)\"")]
+    [InlineData("")]
+    public async Task UnresolvedOrMissingSourceVersionInvalidatesPriorTrustedAssets(string replacement)
+    {
+        using var temporary = new TemporaryDirectory();
+        const string literalProject = """
+            <Project Sdk="Microsoft.NET.Sdk.Web">
+              <PropertyGroup><TargetFramework>net10.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings></PropertyGroup>
+              <ItemGroup><PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite" Version="10.0.11" /></ItemGroup>
+            </Project>
+            """;
+        await WriteProject(temporary.Path, "Api.csproj", literalProject);
+        await WriteProject(temporary.Path, "Program.cs", """
+            using Microsoft.EntityFrameworkCore;
+            var builder = WebApplication.CreateBuilder(args);
+            builder.Services.AddDbContext<OrdersDbContext>(options => options.UseSqlite(builder.Configuration.GetConnectionString("Orders")));
+            builder.Services.AddHttpClient("blocked", client => client.BaseAddress = new Uri("https://stale-assets.example"));
+            var app = builder.Build();
+            app.Run();
+            public sealed class OrdersDbContext(DbContextOptions<OrdersDbContext> options) : DbContext(options);
+            """);
+        await BuildProject(temporary.Path, "Api.csproj");
+        await WriteProject(temporary.Path, "Api.csproj",
+            literalProject.Replace(" Version=\"10.0.11\"", replacement, StringComparison.Ordinal));
+
+        var worker = await RunWorker(temporary.Path);
+        var output = worker.Ready + worker.Output + worker.Error;
+        var messages = worker.Output.Split('\n', StringSplitOptions.RemoveEmptyEntries)
+            .Select(line => JsonSerializer.Deserialize<ProtocolMessage>(line, ContractJson.Options)!).ToArray();
+
+        Assert.Equal(0, worker.ExitCode);
+        Assert.Contains("DOTNET_NUGET_VERSION_UNEVALUATED", output, StringComparison.Ordinal);
+        Assert.Contains("DOTNET_DATA_COMPILATION_UNAVAILABLE", output, StringComparison.Ordinal);
+        Assert.DoesNotContain(messages.OfType<ObservationMessage>(), message =>
+            IsPackageOrSliceEightObservation(message.Observation));
+        Assert.DoesNotContain("SYNTHETIC_VERSION_", output, StringComparison.Ordinal);
+        Assert.DoesNotContain("/home/private/version", output, StringComparison.Ordinal);
+        Assert.DoesNotContain("ConnectionStrings:Orders", output, StringComparison.Ordinal);
+        Assert.DoesNotContain("stale-assets.example", output, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task SourceLessMissingVersionDoesNotClaimDataCompilationFailure()
+    {
+        const string hostileIdentity = "SYNTHETIC_SOURCELESS_VERSION_/home/private/sourceless";
+        using var temporary = new TemporaryDirectory();
+        await WriteProject(temporary.Path, "Library.csproj", $$"""
+            <Project Sdk="Microsoft.NET.Sdk">
+              <PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup>
+              <ItemGroup><PackageReference Include="{{hostileIdentity}}" /></ItemGroup>
+            </Project>
+            """);
+
+        var worker = await RunWorker(temporary.Path);
+        var output = worker.Ready + worker.Output + worker.Error;
+        var messages = worker.Output.Split('\n', StringSplitOptions.RemoveEmptyEntries)
+            .Select(line => JsonSerializer.Deserialize<ProtocolMessage>(line, ContractJson.Options)!).ToArray();
+
+        Assert.Equal(0, worker.ExitCode);
+        Assert.Contains("DOTNET_NUGET_VERSION_UNEVALUATED", output, StringComparison.Ordinal);
+        Assert.DoesNotContain("DOTNET_DATA_COMPILATION_UNAVAILABLE", output, StringComparison.Ordinal);
+        Assert.DoesNotContain(messages.OfType<ObservationMessage>(), message =>
+            IsPackageOrSliceEightObservation(message.Observation));
+        Assert.DoesNotContain("SYNTHETIC_SOURCELESS_VERSION_", output, StringComparison.Ordinal);
+        Assert.DoesNotContain("/home/private/sourceless", output, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ImportedOwnershipWithIrrelevantSourceDoesNotClaimDataCompilationFailure()
+    {
+        const string hostileIdentity = "SYNTHETIC_IRRELEVANT_VERSION_/home/private/irrelevant";
+        using var temporary = new TemporaryDirectory();
+        await WriteProject(temporary.Path, "Versions.props", "<Project />");
+        await WriteProject(temporary.Path, "Library.csproj", $$"""
+            <Project Sdk="Microsoft.NET.Sdk">
+              <Import Project="Versions.props" />
+              <PropertyGroup><TargetFramework>net10.0</TargetFramework></PropertyGroup>
+              <ItemGroup><PackageReference Include="{{hostileIdentity}}" /></ItemGroup>
+            </Project>
+            """);
+        await WriteProject(temporary.Path, "Plain.cs", "public sealed class Plain { }");
+
+        var worker = await RunWorker(temporary.Path);
+        var output = worker.Ready + worker.Output + worker.Error;
+        var messages = worker.Output.Split('\n', StringSplitOptions.RemoveEmptyEntries)
+            .Select(line => JsonSerializer.Deserialize<ProtocolMessage>(line, ContractJson.Options)!).ToArray();
+
+        Assert.Equal(0, worker.ExitCode);
+        Assert.Contains("DOTNET_NUGET_VERSION_UNEVALUATED", output, StringComparison.Ordinal);
+        Assert.DoesNotContain("DOTNET_DATA_COMPILATION_UNAVAILABLE", output, StringComparison.Ordinal);
+        Assert.DoesNotContain(messages.OfType<ObservationMessage>(), message =>
+            IsPackageOrSliceEightObservation(message.Observation));
+        Assert.DoesNotContain("SYNTHETIC_IRRELEVANT_VERSION_", output, StringComparison.Ordinal);
+        Assert.DoesNotContain("/home/private/irrelevant", output, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ImportedCentralMissingVersionStillReportsCompilationUnavailable()
+    {
+        const string hostileIdentity = "SYNTHETIC_CENTRAL_VERSION_/home/private/central";
+        using var temporary = new TemporaryDirectory();
+        await WriteProject(temporary.Path, "Versions.props", """
+            <Project>
+              <PropertyGroup><ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally></PropertyGroup>
+            </Project>
+            """);
+        await WriteProject(temporary.Path, "Api.csproj", $$"""
+            <Project Sdk="Microsoft.NET.Sdk.Web">
+              <Import Project="Versions.props" />
+              <PropertyGroup><TargetFramework>net10.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings></PropertyGroup>
+              <ItemGroup><PackageReference Include="{{hostileIdentity}}" /></ItemGroup>
+            </Project>
+            """);
+        await WriteProject(temporary.Path, "Program.cs", """
+            var builder = WebApplication.CreateBuilder(args);
+            builder.Services.AddHttpClient("blocked", client => client.BaseAddress = new Uri("https://central-version.example"));
+            """);
+
+        var worker = await RunWorker(temporary.Path);
+        var output = worker.Ready + worker.Output + worker.Error;
+        var messages = worker.Output.Split('\n', StringSplitOptions.RemoveEmptyEntries)
+            .Select(line => JsonSerializer.Deserialize<ProtocolMessage>(line, ContractJson.Options)!).ToArray();
+
+        Assert.Equal(0, worker.ExitCode);
+        Assert.Contains("DOTNET_NUGET_VERSION_UNEVALUATED", output, StringComparison.Ordinal);
+        Assert.Contains("DOTNET_DATA_COMPILATION_UNAVAILABLE", output, StringComparison.Ordinal);
+        Assert.DoesNotContain(messages.OfType<ObservationMessage>(), message =>
+            IsPackageOrSliceEightObservation(message.Observation));
+        Assert.DoesNotContain("SYNTHETIC_CENTRAL_VERSION_", output, StringComparison.Ordinal);
+        Assert.DoesNotContain("/home/private/central", output, StringComparison.Ordinal);
+        Assert.DoesNotContain("central-version.example", output, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("alternate-root-traversal")]
+    [InlineData("package-alias")]
+    [InlineData("malformed-package-key")]
+    public async Task TamperedAssetsCannotAuthorizeTargetMetadata(string mutation)
+    {
+        using var temporary = new TemporaryDirectory();
+        await WriteProject(temporary.Path, "Api.csproj", """
+            <Project Sdk="Microsoft.NET.Sdk.Web">
+              <PropertyGroup><TargetFramework>net10.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings></PropertyGroup>
+              <ItemGroup><PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite" Version="10.0.11" /></ItemGroup>
+            </Project>
+            """);
+        await WriteProject(temporary.Path, "Program.cs", """
+            var builder = WebApplication.CreateBuilder(args);
+            builder.Services.AddHttpClient("tampered", client => client.BaseAddress = new Uri("https://tampered-assets.example"));
+            var app = builder.Build();
+            app.Run();
+            """);
+        await BuildProject(temporary.Path, "Api.csproj");
+        var assetsPath = Path.Combine(temporary.Path, "obj", "project.assets.json");
+        var assets = JsonNode.Parse(await File.ReadAllTextAsync(assetsPath))!.AsObject();
+        var target = assets["targets"]!["net10.0"]!.AsObject();
+        if (mutation == "alternate-root-traversal")
+        {
+            assets["packageFolders"] = new JsonObject { [Path.GetPathRoot(temporary.Path)!] = new JsonObject() };
+            var ef = target.Single(item => item.Key.StartsWith("Microsoft.EntityFrameworkCore/", StringComparison.Ordinal)).Value!.AsObject();
+            ef["compile"] = new JsonObject
+            {
+                ["ref/../../../../home/user/workspace/repo/src/Archie.Scanner.DotNet/bin/Debug/net10.0/Archie.Scanner.DotNet.dll"] = new JsonObject()
+            };
+        }
+        else
+        {
+            var analyzer = target.Single(item =>
+                item.Key.StartsWith("Microsoft.EntityFrameworkCore.Analyzers/", StringComparison.Ordinal));
+            if (mutation == "package-alias") analyzer.Value!.AsObject()["aliases"] = "global";
+            else
+            {
+                target.Remove(analyzer.Key);
+                target["../10.0.11"] = analyzer.Value;
+            }
+        }
+        await File.WriteAllTextAsync(assetsPath, assets.ToJsonString());
+        var worker = await RunWorker(temporary.Path);
+
+        Assert.Contains("DOTNET_DATA_COMPILATION_UNAVAILABLE", worker.Output, StringComparison.Ordinal);
+        Assert.DoesNotContain("tampered-assets.example", worker.Output + worker.Error, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task IncompatibleTargetRestoreFailsClosedWithoutBorrowingScannerReferences()
+    {
+        using var temporary = new TemporaryDirectory();
+        await WriteProject(temporary.Path, "Api.csproj", """
+            <Project Sdk="Microsoft.NET.Sdk.Web">
+              <PropertyGroup><TargetFramework>net8.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings></PropertyGroup>
+              <ItemGroup><PackageReference Include="Microsoft.EntityFrameworkCore.Sqlite" Version="10.0.11" /></ItemGroup>
+            </Project>
+            """);
+        await WriteProject(temporary.Path, "Program.cs", """
+            using Microsoft.EntityFrameworkCore;
+            var builder = WebApplication.CreateBuilder(args);
+            builder.Services.AddDbContext<OrdersDbContext>(options => options.UseSqlite(builder.Configuration.GetConnectionString("Orders")));
+            builder.Services.AddHttpClient("phantom", client => client.BaseAddress = new Uri("https://phantom.example"));
+            var app = builder.Build();
+            app.Run();
+            public sealed class OrdersDbContext(DbContextOptions<OrdersDbContext> options) : DbContext(options);
+            """);
+
+        var restore = await RunDotNet(temporary.Path, "restore", "Api.csproj", "--nologo");
+        var result = await new DotNetScanner().ScanAsync(temporary.Path, CancellationToken.None);
+        var worker = await RunWorker(temporary.Path);
+
+        Assert.NotEqual(0, restore.ExitCode);
+        Assert.Contains("NU1202", restore.Output + restore.Error, StringComparison.Ordinal);
+        Assert.Contains(result.Diagnostics, item => item.Code == "DOTNET_DATA_COMPILATION_UNAVAILABLE");
+        Assert.DoesNotContain(result.Observations.OfType<RelationshipObservation>(), item =>
+            item.To.Kind is NodeKind.Database or NodeKind.ExternalService);
+        Assert.True(worker.Output.Contains("DOTNET_DATA_COMPILATION_UNAVAILABLE", StringComparison.Ordinal), worker.Output + worker.Error);
+        Assert.DoesNotContain("phantom.example", worker.Output + worker.Error, StringComparison.Ordinal);
+        Assert.DoesNotContain("ConnectionStrings:Orders", worker.Output + worker.Error, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task RealWorkerSuppressesConflictingClientsAndSensitiveKeyVariantsBeforeNdjson()
+    {
+        const string sentinel = "SYNTHETIC_RAW_API_KEY_SENTINEL";
+        using var temporary = new TemporaryDirectory();
+        await WriteProject(temporary.Path, "Api.csproj", "<Project Sdk=\"Microsoft.NET.Sdk.Web\"><PropertyGroup><TargetFramework>net10.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings></PropertyGroup></Project>");
+        await WriteProject(temporary.Path, "Program.cs", $$"""
+            var builder = WebApplication.CreateBuilder(args);
+            builder.Services.AddHttpClient("same", client => client.BaseAddress = new Uri("https://same.example"));
+            builder.Services.AddHttpClient(configureClient: client => client.BaseAddress = new Uri("https://same.example"), name: "same");
+            builder.Services.AddHttpClient("payments", client => client.BaseAddress = new Uri("https://first.example"));
+            builder.Services.AddHttpClient(name: "payments", configureClient: client => client.BaseAddress = new Uri("https://second.example"));
+            builder.Services.AddHttpClient<PaymentClient>(client => client.BaseAddress = new Uri("https://typed.example"));
+            builder.Services.AddHttpClient("named", client => client.BaseAddress = new Uri("https://named.example"));
+            builder.Services.AddHttpClient("sensitive", client => client.BaseAddress = new Uri(builder.Configuration["Payment:Api_Key:{{sentinel}}"] ?? "https://sensitive.example"));
+            builder.Services.AddHttpClient("auth", client => client.BaseAddress = new Uri(builder.Configuration["Payment:Auth"] ?? "https://auth-sensitive.example"));
+            builder.Services.AddHttpClient("fullwidth-auth", client => client.BaseAddress = new Uri(builder.Configuration["Payment:ａｕｔｈ"] ?? "https://fullwidth-auth-sensitive.example"));
+            builder.Services.AddHttpClient("compatibility-auth", client => client.BaseAddress = new Uri(builder.Configuration["Payment:ᴬᵁᵀᴴ"] ?? "https://compatibility-auth-sensitive.example"));
+            builder.Services.AddHttpClient("combining-auth", client => client.BaseAddress = new Uri(builder.Configuration["Payment:a\u0301uth"] ?? "https://combining-auth-sensitive.example"));
+            builder.Services.AddHttpClient("author", client => client.BaseAddress = new Uri(builder.Configuration["Payment:Author"] ?? "https://author-safe.example"));
+            builder.Services.AddHttpClient("authority", client => client.BaseAddress = new Uri(builder.Configuration["Payment:Authority"] ?? "https://authority-safe.example"));
+            builder.Services.AddHttpClient<IPartnerClient, PartnerOne>(client => client.BaseAddress = new Uri("https://implementation-one.example"));
+            builder.Services.AddHttpClient<IPartnerClient, PartnerTwo>(client => client.BaseAddress = new Uri("https://implementation-two.example"));
+            var app = builder.Build();
+            app.Run();
+            public sealed class PaymentClient(HttpClient client) { public HttpClient Client { get; } = client; }
+            public interface IPartnerClient { }
+            public sealed class PartnerOne(HttpClient client) : IPartnerClient { public HttpClient Client { get; } = client; }
+            public sealed class PartnerTwo(HttpClient client) : IPartnerClient { public HttpClient Client { get; } = client; }
+            """);
+        await BuildProject(temporary.Path, "Api.csproj");
+
+        var worker = await RunWorker(temporary.Path);
+        var output = worker.Ready + worker.Output + worker.Error;
+
+        Assert.Equal(0, worker.ExitCode);
+        Assert.True(output.Contains("DOTNET_EXTERNAL_TARGET_AMBIGUOUS", StringComparison.Ordinal), output);
+        Assert.Contains("DOTNET_EXTERNAL_TARGET_UNRESOLVED", output, StringComparison.Ordinal);
+        Assert.Contains("same.example", output, StringComparison.Ordinal);
+        Assert.Contains("typed.example", output, StringComparison.Ordinal);
+        Assert.Contains("named.example", output, StringComparison.Ordinal);
+        Assert.Contains("author-safe.example", output, StringComparison.Ordinal);
+        Assert.Contains("authority-safe.example", output, StringComparison.Ordinal);
+        Assert.DoesNotContain("first.example", output, StringComparison.Ordinal);
+        Assert.DoesNotContain("second.example", output, StringComparison.Ordinal);
+        Assert.DoesNotContain("implementation-one.example", output, StringComparison.Ordinal);
+        Assert.DoesNotContain("implementation-two.example", output, StringComparison.Ordinal);
+        Assert.DoesNotContain("sensitive.example", output, StringComparison.Ordinal);
+        Assert.DoesNotContain("auth-sensitive.example", output, StringComparison.Ordinal);
+        Assert.DoesNotContain("fullwidth-auth-sensitive.example", output, StringComparison.Ordinal);
+        Assert.DoesNotContain("compatibility-auth-sensitive.example", output, StringComparison.Ordinal);
+        Assert.DoesNotContain("combining-auth-sensitive.example", output, StringComparison.Ordinal);
+        Assert.DoesNotContain(sentinel, output, StringComparison.Ordinal);
+        Assert.DoesNotContain("Payment:Api_Key", output, StringComparison.Ordinal);
+        Assert.DoesNotContain("\"Payment:Auth\"", output, StringComparison.Ordinal);
+        foreach (var unsafeKey in new[] { "Payment:ａｕｔｈ", "Payment:ᴬᵁᵀᴴ", "Payment:a\u0301uth" })
+            Assert.DoesNotContain(JsonSerializer.Serialize(unsafeKey, ContractJson.Options).Trim('"'), output,
+                StringComparison.Ordinal);
+    }
+
     private static void AssertEndpoint(IEnumerable<EntityObservation> entities, string method, string route) =>
         Assert.Contains(entities, item => item.Entity.Kind == NodeKind.HttpEndpoint &&
             item.Entity.Properties["httpMethod"].GetString() == method && item.Entity.Properties["routeTemplate"].GetString() == route);
+
+    private static bool IsPackageOrSliceEightObservation(Observation observation) => observation switch
+    {
+        EntityObservation entity => entity.Entity.Kind is NodeKind.Component or NodeKind.Database or NodeKind.ExternalService,
+        RelationshipObservation relationship => relationship.From.Kind is NodeKind.Component or NodeKind.Database or NodeKind.ExternalService ||
+                                                relationship.To.Kind is NodeKind.Component or NodeKind.Database or NodeKind.ExternalService,
+        _ => false
+    };
 
     private static RelationshipObservation[] Messaging(DotNetScanResult result) => result.Observations
         .OfType<RelationshipObservation>().Where(item => item.Relationship is EdgeKind.Publishes or EdgeKind.Subscribes).ToArray();
@@ -903,6 +1822,75 @@ public sealed class DotNetScannerTests
         var path = Path.Combine(root, relativePath);
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
         return File.WriteAllTextAsync(path, content);
+    }
+
+    private static async Task BuildProject(string root, string project)
+    {
+        var start = new ProcessStartInfo("dotnet")
+        {
+            WorkingDirectory = root,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false
+        };
+        start.Environment["MSBUILDDISABLENODEREUSE"] = "1";
+        start.ArgumentList.Add("build");
+        start.ArgumentList.Add(project);
+        start.ArgumentList.Add("--nologo");
+        using var process = Process.Start(start) ?? throw new InvalidOperationException("Could not start dotnet build.");
+        var output = process.StandardOutput.ReadToEndAsync();
+        var error = process.StandardError.ReadToEndAsync();
+        await process.WaitForExitAsync();
+        Assert.True(process.ExitCode == 0, $"{await output}{await error}");
+    }
+
+    private static async Task<(int ExitCode, string Output, string Error)> RunDotNet(
+        string root,
+        params string[] arguments)
+    {
+        var start = new ProcessStartInfo("dotnet")
+        {
+            WorkingDirectory = root,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false
+        };
+        start.Environment["MSBUILDDISABLENODEREUSE"] = "1";
+        foreach (var argument in arguments) start.ArgumentList.Add(argument);
+        using var process = Process.Start(start) ?? throw new InvalidOperationException("Could not start dotnet.");
+        var output = process.StandardOutput.ReadToEndAsync();
+        var error = process.StandardError.ReadToEndAsync();
+        await process.WaitForExitAsync();
+        return (process.ExitCode, await output, await error);
+    }
+
+    private static async Task<(int ExitCode, string Ready, string Output, string Error)> RunWorker(string checkoutPath)
+    {
+        var start = new ProcessStartInfo("dotnet", typeof(DotNetScanner).Assembly.Location)
+        {
+            RedirectStandardInput = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false
+        };
+        using var process = Process.Start(start) ?? throw new InvalidOperationException("Could not start .NET worker.");
+        var ready = await process.StandardOutput.ReadLineAsync() ?? string.Empty;
+        using var configuration = JsonDocument.Parse("{}");
+        ProtocolMessage request = new ScanRequestMessage(
+            "scanner/v1",
+            new ScanContext(
+                new("hostile", null, new string('a', 40), true, new string('b', 64)),
+                checkoutPath,
+                configuration.RootElement.Clone()));
+        var protocolJson = new JsonSerializerOptions(ContractJson.Options) { WriteIndented = false };
+        var serializedRequest = JsonSerializer.Serialize(request, protocolJson);
+        _ = JsonSerializer.Deserialize<ProtocolMessage>(serializedRequest, ContractJson.Options);
+        await process.StandardInput.WriteLineAsync(serializedRequest);
+        process.StandardInput.Close();
+        var output = process.StandardOutput.ReadToEndAsync();
+        var error = process.StandardError.ReadToEndAsync();
+        await process.WaitForExitAsync();
+        return (process.ExitCode, ready, await output, await error);
     }
 
     private static async Task<string> EvaluateMsBuild(string root, string project, params string[] arguments)
@@ -934,7 +1922,7 @@ public sealed class DotNetScannerTests
     private static ObservationBundle Bundle(DotNetScanResult result) => new(
         "observations/v1", ObservationSource.Scanner, new string('a', 64),
         new("dotnet-reference", null, "reference", false, new string('b', 64)),
-        [new("archie.dotnet", "1.1.0")], result.Observations, result.Diagnostics, []);
+        [new("archie.dotnet", "1.2.0")], result.Observations, result.Diagnostics, []);
 
     private static string Fixture() => Path.Combine(AppContext.BaseDirectory, "fixtures", "dotnet-reference");
 

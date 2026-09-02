@@ -25,12 +25,15 @@ internal sealed record ProjectModel(
     string Key,
     string Name,
     string Path,
+    string FullPath,
     SourceRange? Range,
     string? Classification,
     IReadOnlyList<string>? TargetFrameworks,
     IReadOnlyList<ProjectPackage> Packages,
     IReadOnlyList<ProjectReferenceModel> ProjectReferences,
     IReadOnlyList<SourceFile> Sources,
+    IReadOnlyList<SourceFile> CandidateSources,
+    bool CompileInputsUncertain,
     bool ImplicitUsings,
     bool IsService);
 
