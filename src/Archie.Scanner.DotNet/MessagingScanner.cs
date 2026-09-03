@@ -73,19 +73,26 @@ internal static class MessagingScanner
             ? """
                 global using System;
                 global using System.Collections.Generic;
+                global using System.IO;
                 global using System.Linq;
+                global using System.Net.Http;
                 global using System.Threading;
                 global using System.Threading.Tasks;
                 global using Microsoft.AspNetCore.Builder;
+                global using Microsoft.AspNetCore.Hosting;
                 global using Microsoft.AspNetCore.Http;
                 global using Microsoft.AspNetCore.Routing;
+                global using Microsoft.Extensions.Configuration;
                 global using Microsoft.Extensions.DependencyInjection;
                 global using Microsoft.Extensions.Hosting;
+                global using Microsoft.Extensions.Logging;
                 """
             : """
                 global using System;
                 global using System.Collections.Generic;
+                global using System.IO;
                 global using System.Linq;
+                global using System.Net.Http;
                 global using System.Threading;
                 global using System.Threading.Tasks;
                 """;
@@ -163,6 +170,7 @@ internal static class MessagingScanner
     private static void ScanServiceBusClients(ProjectModel project, SyntaxTree tree, SyntaxNode root, SemanticModel model,
         ICollection<MessageChannelDetection> detections, ICollection<Diagnostic> diagnostics)
     {
+        var senderFactories = new List<(InvocationExpressionSyntax Invocation, IMethodSymbol Symbol, ServiceBusDestination Destination)>();
         foreach (var invocation in root.DescendantNodes().OfType<InvocationExpressionSyntax>())
         {
             if (model.GetSymbolInfo(invocation).Symbol is not IMethodSymbol symbol ||
@@ -181,6 +189,10 @@ internal static class MessagingScanner
                 detections.Add(new("azure-service-bus", destination.Kind, destination.Name, destination.Topic, destination.Subscription, EdgeKind.Subscribes,
                     null, tree.FilePath, Range(tree, invocation), "roslyn:semantic-service-bus-processor-dataflow", symbol.ToDisplayString()));
             }
+            else
+            {
+                senderFactories.Add((invocation, symbol, destination));
+            }
         }
 
         foreach (var invocation in root.DescendantNodes().OfType<InvocationExpressionSyntax>())
@@ -189,11 +201,17 @@ internal static class MessagingScanner
                 model.GetSymbolInfo(invocation).Symbol is not IMethodSymbol symbol ||
                 !KnownAssembly(symbol.ContainingAssembly, ServiceBusAssembly) ||
                 symbol.ContainingType.ToDisplayString() != ServiceBusSender || symbol.Name is not ("SendMessageAsync" or "SendMessagesAsync")) continue;
-            if (model.GetSymbolInfo(member.Expression).Symbol is not ILocalSymbol receiver ||
-                !TryReachingSenderDestination(root, model, receiver, invocation, out var sender))
+            if (model.GetSymbolInfo(member.Expression).Symbol is not ILocalSymbol receiver)
+            {
+                if (senderFactories.Count == 0)
+                    diagnostics.Add(Warning("DOTNET_MESSAGE_SENDER_FLOW_UNRESOLVED", tree, invocation,
+                        "A semantically resolved Service Bus send has no resolved sender factory in this source file; no relationship fact was invented.", project.Key));
+                continue;
+            }
+            if (!TryReachingSenderDestination(root, model, receiver, invocation, out var sender))
             {
                 diagnostics.Add(Warning("DOTNET_MESSAGE_SENDER_FLOW_UNRESOLVED", tree, invocation,
-                    "A semantically resolved Service Bus send does not have one unambiguous reaching literal CreateSender assignment; no relationship fact was invented.", project.Key));
+                    "A semantically resolved Service Bus send does not have one unambiguous direct local sender factory; no relationship fact was invented.", project.Key));
                 continue;
             }
             var payload = (model.GetOperation(invocation) as IInvocationOperation)?.Arguments
@@ -205,6 +223,17 @@ internal static class MessagingScanner
             detections.Add(new("azure-service-bus", sender.Kind, sender.Name, sender.Topic, sender.Subscription,
                 EdgeKind.Publishes, contract, tree.FilePath, Range(tree, invocation),
                 "roslyn:semantic-service-bus-sender-dataflow", symbol.ToDisplayString()));
+        }
+
+        foreach (var (invocation, symbol, destination) in senderFactories)
+        {
+            if (!detections.Any(item => item.Provider == "azure-service-bus" && item.Relationship == EdgeKind.Publishes &&
+                                        item.Name == destination.Name && item.Path == tree.FilePath))
+                diagnostics.Add(Warning("DOTNET_MESSAGE_CONTRACT_UNRESOLVED", tree, invocation,
+                    $"Service Bus destination '{destination.Name}' was resolved from a sender factory, but the message contract was not safely resolvable.", project.Key));
+            detections.Add(new("azure-service-bus", destination.Kind, destination.Name, destination.Topic, destination.Subscription,
+                EdgeKind.Publishes, null, tree.FilePath, Range(tree, invocation),
+                "roslyn:semantic-service-bus-sender-factory", symbol.ToDisplayString()));
         }
     }
 
@@ -312,9 +341,9 @@ internal static class MessagingScanner
 
     private static string? FirstStringArgument(SemanticModel model, InvocationExpressionSyntax invocation, IMethodSymbol symbol) =>
         symbol.Parameters.Where(item => item.Type.SpecialType == SpecialType.System_String)
-            .Select(item => ConstantStringArguments(model, invocation).GetValueOrDefault(item.Name)).FirstOrDefault();
+            .Select(item => DestinationStringArguments(model, invocation).GetValueOrDefault(item.Name)).FirstOrDefault();
 
-    private static Dictionary<string, string?> ConstantStringArguments(SemanticModel model, InvocationExpressionSyntax invocation)
+    private static Dictionary<string, string?> DestinationStringArguments(SemanticModel model, InvocationExpressionSyntax invocation)
     {
         var values = new Dictionary<string, string?>(StringComparer.Ordinal);
         if (model.GetOperation(invocation) is not IInvocationOperation operation) return values;
@@ -322,17 +351,47 @@ internal static class MessagingScanner
         {
             var parameter = argument.Parameter;
             if (parameter?.Type.SpecialType != SpecialType.System_String) continue;
-            var constant = argument.Value.ConstantValue;
-            values[parameter.Name] = constant.HasValue && constant.Value is string text && !string.IsNullOrWhiteSpace(text) ? text : null;
+            values[parameter.Name] = argument.Value.Syntax is ExpressionSyntax expression
+                ? DestinationString(model, expression, invocation)
+                : null;
         }
         return values;
+    }
+
+    private static string? DestinationString(SemanticModel model, ExpressionSyntax expression, SyntaxNode use)
+    {
+        var constant = model.GetConstantValue(expression);
+        if (constant.HasValue && constant.Value is string text && !string.IsNullOrWhiteSpace(text)) return text;
+        if (expression is ParenthesizedExpressionSyntax parenthesized)
+            return DestinationString(model, parenthesized.Expression, use);
+        if (expression is BinaryExpressionSyntax { RawKind: (int)SyntaxKind.CoalesceExpression } coalesce &&
+            ConfigurationElement(model, coalesce.Left))
+            return DestinationString(model, coalesce.Right, use);
+        if (model.GetSymbolInfo(expression).Symbol is not ILocalSymbol local) return null;
+        var declarations = expression.SyntaxTree.GetRoot().DescendantNodes().OfType<VariableDeclaratorSyntax>()
+            .Where(item => item.SpanStart < use.SpanStart && item.Initializer is not null &&
+                           SymbolEqualityComparer.Default.Equals(model.GetDeclaredSymbol(item), local)).ToArray();
+        if (declarations.Length != 1 || expression.SyntaxTree.GetRoot().DescendantNodes().OfType<AssignmentExpressionSyntax>()
+                .Any(item => item.SpanStart < use.SpanStart &&
+                             SymbolEqualityComparer.Default.Equals(model.GetSymbolInfo(item.Left).Symbol, local))) return null;
+        return DestinationString(model, declarations[0].Initializer!.Value, declarations[0]);
+    }
+
+    private static bool ConfigurationElement(SemanticModel model, ExpressionSyntax expression)
+    {
+        if (expression is not ElementAccessExpressionSyntax { ArgumentList.Arguments.Count: 1 } element ||
+            model.GetConstantValue(element.ArgumentList.Arguments[0].Expression) is not { HasValue: true, Value: string key } ||
+            string.IsNullOrWhiteSpace(key)) return false;
+        var type = model.GetTypeInfo(element.Expression).Type as INamedTypeSymbol;
+        return type is not null && (type.ToDisplayString() == "Microsoft.Extensions.Configuration.IConfiguration" ||
+                                    type.AllInterfaces.Any(item => item.ToDisplayString() == "Microsoft.Extensions.Configuration.IConfiguration"));
     }
 
     private static bool TryServiceBusDestination(SemanticModel model, InvocationExpressionSyntax invocation,
         IMethodSymbol symbol, out ServiceBusDestination destination)
     {
         destination = null!;
-        var values = ConstantStringArguments(model, invocation);
+        var values = DestinationStringArguments(model, invocation);
         if (symbol.Name == "CreateProcessor" && symbol.Parameters.Any(item => item.Name == "subscriptionName"))
         {
             if (!values.TryGetValue("topicName", out var topic) || topic is null ||

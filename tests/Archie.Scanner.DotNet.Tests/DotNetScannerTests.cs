@@ -555,6 +555,73 @@ public sealed class DotNetScannerTests
     }
 
     [Fact]
+    public async Task WebMessagingCompilationIncludesSdkImplicitUsings()
+    {
+        using var temporary = new TemporaryDirectory();
+        await WriteProject(temporary.Path, "Consumer.csproj", """
+            <Project Sdk="Microsoft.NET.Sdk.Web">
+              <PropertyGroup><TargetFramework>net10.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings></PropertyGroup>
+              <ItemGroup><PackageReference Include="Confluent.Kafka" Version="2.15.0" /></ItemGroup>
+            </Project>
+            """);
+        await WriteProject(temporary.Path, "Program.cs", """
+            using Confluent.Kafka;
+            public sealed record OrderCreated(Guid OrderId, DateTimeOffset OccurredAt);
+            public sealed class Consumer(
+                IConsumer<string, string> consumer,
+                IConfiguration configuration,
+                ILogger<Consumer> logger) : BackgroundService
+            {
+                protected override Task ExecuteAsync(CancellationToken stoppingToken)
+                {
+                    var topic = configuration["Kafka:Topic"] ?? "orders.created-v1";
+                    consumer.Subscribe(topic);
+                    logger.LogInformation("Consuming {Topic}", topic);
+                    return Task.CompletedTask;
+                }
+            }
+            """);
+
+        var result = await new DotNetScanner().ScanAsync(temporary.Path, CancellationToken.None);
+
+        Assert.Contains(Messaging(result), item =>
+            item.Relationship == EdgeKind.Subscribes && item.To.Name == "orders.created-v1");
+        Assert.DoesNotContain(result.Diagnostics, item => item.Code == "DOTNET_MESSAGING_COMPILATION_UNAVAILABLE");
+    }
+
+    [Fact]
+    public async Task ServiceBusSenderFactoryEstablishesOutboundDependencyWithoutGuessingParameterOrigin()
+    {
+        using var temporary = new TemporaryDirectory();
+        await WriteProject(temporary.Path, "Producer.csproj", """
+            <Project Sdk="Microsoft.NET.Sdk.Web">
+              <PropertyGroup><TargetFramework>net10.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings></PropertyGroup>
+              <ItemGroup><PackageReference Include="Azure.Messaging.ServiceBus" Version="7.20.1" /></ItemGroup>
+            </Project>
+            """);
+        await WriteProject(temporary.Path, "Program.cs", """
+            using Azure.Messaging.ServiceBus;
+            public static class Producer
+            {
+                public static void Register(IServiceCollection services) =>
+                    services.AddSingleton(provider => provider.GetRequiredService<ServiceBusClient>().CreateSender(
+                        provider.GetRequiredService<IConfiguration>()["ServiceBus:QueueName"] ?? "orders-created"));
+                public static Task Send(ServiceBusSender sender) =>
+                    sender.SendMessageAsync(new ServiceBusMessage("payload"));
+            }
+            """);
+
+        var result = await new DotNetScanner().ScanAsync(temporary.Path, CancellationToken.None);
+
+        Assert.Contains(Messaging(result), item =>
+            item.Relationship == EdgeKind.Publishes && item.To.Name == "orders-created" &&
+            item.Evidence.ExtractionMethod == "roslyn:semantic-service-bus-sender-factory");
+        Assert.DoesNotContain(Messaging(result), item =>
+            item.Evidence.ExtractionMethod == "roslyn:semantic-service-bus-sender-dataflow");
+        Assert.DoesNotContain(result.Diagnostics, item => item.Code == "DOTNET_MESSAGE_SENDER_FLOW_UNRESOLVED");
+    }
+
+    [Fact]
     public async Task ServiceBusOperationsRequireResolvedAzureSymbolsAndPreserveSubscriptionUncertainty()
     {
         using var temporary = new TemporaryDirectory();
@@ -591,7 +658,7 @@ public sealed class DotNetScannerTests
         var messaging = Messaging(result);
 
         Assert.Contains(messaging, item => item.Relationship == EdgeKind.Publishes && item.To.Name == "fulfilment.requested" &&
-            item.Properties["contract"].GetString() == "FulfilmentRequested");
+            item.Properties.TryGetValue("contract", out var contract) && contract.GetString() == "FulfilmentRequested");
         Assert.Contains(messaging, item => item.Relationship == EdgeKind.Subscribes && item.To.Name == "dispatch.events/notifications" &&
             item.Properties["subscription"].GetString() == "notifications");
         Assert.Contains(messaging, item => item.Relationship == EdgeKind.Subscribes &&
@@ -798,9 +865,12 @@ public sealed class DotNetScannerTests
         var result = await new DotNetScanner().ScanAsync(temporary.Path, CancellationToken.None);
 
         var publishes = Messaging(result).Where(item => item.Relationship == EdgeKind.Publishes).ToArray();
-        Assert.Equal(2, publishes.Length);
-        Assert.Contains(publishes, item => item.To.Name == "valid.direct" && item.Properties["contract"].GetString() == "Event");
-        Assert.Contains(publishes, item => item.To.Name == "valid.assignment" && item.Properties["contract"].GetString() == "BatchEvent");
+        Assert.Equal(17, publishes.Count(item => item.Evidence.ExtractionMethod == "roslyn:semantic-service-bus-sender-factory"));
+        Assert.Equal(2, publishes.Count(item => item.Evidence.ExtractionMethod == "roslyn:semantic-service-bus-sender-dataflow"));
+        Assert.Contains(publishes, item => item.To.Name == "valid.direct" &&
+            item.Properties.TryGetValue("contract", out var contract) && contract.GetString() == "Event");
+        Assert.Contains(publishes, item => item.To.Name == "valid.assignment" &&
+            item.Properties.TryGetValue("contract", out var contract) && contract.GetString() == "BatchEvent");
         Assert.Equal(13, result.Diagnostics.Count(item => item.Code == "DOTNET_MESSAGE_SENDER_FLOW_UNRESOLVED"));
         Assert.Contains(result.Diagnostics, item => item.Code == "DOTNET_MESSAGE_DESTINATION_UNRESOLVED");
         Assert.DoesNotContain(result.Diagnostics, item => item.Code == "DOTNET_MESSAGE_CONTRACT_UNRESOLVED" &&
