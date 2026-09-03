@@ -1,7 +1,6 @@
 using System.Text.RegularExpressions;
 using System.Xml;
 using System.Xml.Linq;
-using Archie.Contracts;
 
 namespace Archie.Scanner.DotNet;
 

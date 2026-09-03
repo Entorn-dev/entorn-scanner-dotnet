@@ -1,4 +1,3 @@
-using Archie.Contracts;
 using Azure.Messaging.ServiceBus;
 using Confluent.Kafka;
 using Microsoft.Azure.Functions.Worker;
@@ -6,7 +5,7 @@ using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Microsoft.CodeAnalysis.Operations;
-using Diagnostic = Archie.Contracts.Diagnostic;
+using Diagnostic = Archie.Scanner.Contracts.Diagnostic;
 
 namespace Archie.Scanner.DotNet;
 

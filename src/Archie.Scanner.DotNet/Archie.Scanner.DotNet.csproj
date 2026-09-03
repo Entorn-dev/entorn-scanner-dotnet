@@ -15,7 +15,8 @@
     <FrameworkReference Include="Microsoft.AspNetCore.App" />
   </ItemGroup>
   <ItemGroup>
-    <ProjectReference Include="../Archie.Contracts/Archie.Contracts.csproj" />
+    <ProjectReference Include="../Archie.Scanner.Contracts/Archie.Scanner.Contracts.csproj" />
+    <Using Include="Archie.Scanner.Contracts" />
   </ItemGroup>
   <ItemGroup>
     <None Update="scanner.json" CopyToOutputDirectory="PreserveNewest" />

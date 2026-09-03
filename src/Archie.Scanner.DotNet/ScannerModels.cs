@@ -1,5 +1,3 @@
-using Archie.Contracts;
-
 namespace Archie.Scanner.DotNet;
 
 public sealed record DotNetScannerLimits(

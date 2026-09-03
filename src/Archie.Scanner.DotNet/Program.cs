@@ -1,12 +1,11 @@
 using System.Text;
 using System.Text.Json;
 using System.Runtime.InteropServices;
-using Archie.Contracts;
 using Archie.Scanner.DotNet;
 
 const string protocolVersion = "scanner/v1";
 var scanner = new ScannerIdentity("archie.dotnet", "1.3.0");
-var json = new JsonSerializerOptions(ContractJson.Options) { WriteIndented = false };
+var json = new JsonSerializerOptions(ScannerContractJson.Options) { WriteIndented = false };
 using var cancellation = new CancellationTokenSource();
 using var terminateSignal = OperatingSystem.IsWindows() ? null : PosixSignalRegistration.Create(PosixSignal.SIGTERM, context =>
 {
@@ -26,7 +25,7 @@ try
 {
     var line = await ReadBoundedLineAsync(Console.OpenStandardInput(), DotNetWorkerLimits.MaxRequestBytes, cancellation.Token);
     if (line is null) throw new InvalidDataException("Scan request was not provided.");
-    var message = JsonSerializer.Deserialize<ProtocolMessage>(line, ContractJson.Options);
+    var message = JsonSerializer.Deserialize<ProtocolMessage>(line, ScannerContractJson.Options);
     if (message is not ScanRequestMessage request || request.ProtocolVersion != protocolVersion)
         throw new InvalidDataException("Expected one scanner/v1 scan-request message.");
 

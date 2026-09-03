@@ -675,18 +675,25 @@
         }
       },
       "archie.contracts": {
-        "type": "Project"
+        "type": "Project",
+        "dependencies": {
+          "Archie.Scanner.Contracts": "[1.0.0, )"
+        }
       },
       "archie.core": {
         "type": "Project",
         "dependencies": {
-          "Archie.Contracts": "[1.0.0, )"
+          "Archie.Contracts": "[1.0.0, )",
+          "Archie.Scanner.Contracts": "[1.0.0, )"
         }
+      },
+      "archie.scanner.contracts": {
+        "type": "Project"
       },
       "archie.scanner.dotnet": {
         "type": "Project",
         "dependencies": {
-          "Archie.Contracts": "[1.0.0, )",
+          "Archie.Scanner.Contracts": "[1.0.0, )",
           "Azure.Messaging.ServiceBus": "[7.20.1, )",
           "Confluent.Kafka": "[2.12.0, )",
           "Microsoft.Azure.Functions.Worker": "[2.51.0, )",

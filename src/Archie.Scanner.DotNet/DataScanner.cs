@@ -1,4 +1,3 @@
-using Archie.Contracts;
 using System.Collections.Immutable;
 using System.Reflection.Metadata;
 using System.Reflection.PortableExecutable;
@@ -9,7 +8,7 @@ using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Microsoft.CodeAnalysis.Operations;
-using Diagnostic = Archie.Contracts.Diagnostic;
+using Diagnostic = Archie.Scanner.Contracts.Diagnostic;
 
 namespace Archie.Scanner.DotNet;
 
