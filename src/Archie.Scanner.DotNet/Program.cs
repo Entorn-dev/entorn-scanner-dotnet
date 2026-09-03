@@ -5,7 +5,7 @@ using Archie.Contracts;
 using Archie.Scanner.DotNet;
 
 const string protocolVersion = "scanner/v1";
-var scanner = new ScannerIdentity("archie.dotnet", "1.2.0");
+var scanner = new ScannerIdentity("archie.dotnet", "1.3.0");
 var json = new JsonSerializerOptions(ContractJson.Options) { WriteIndented = false };
 using var cancellation = new CancellationTokenSource();
 using var terminateSignal = OperatingSystem.IsWindows() ? null : PosixSignalRegistration.Create(PosixSignal.SIGTERM, context =>
@@ -34,7 +34,10 @@ try
     var messages = new List<ProtocolMessage>();
     messages.AddRange(result.Diagnostics.Select(item => (ProtocolMessage)new DiagnosticMessage(protocolVersion, item)));
     if (result.Succeeded)
+    {
         messages.AddRange(result.Observations.Select(item => (ProtocolMessage)new ObservationMessage(protocolVersion, item)));
+        messages.AddRange(result.SourceOwnership.Select(item => (ProtocolMessage)new SourceOwnershipMessage(protocolVersion, item)));
+    }
     messages.Add(new CompletedMessage(protocolVersion, new(result.Succeeded ? result.Observations.Count : 0)));
 
     var lines = messages.Select(Serialize).ToArray();

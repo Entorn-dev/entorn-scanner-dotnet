@@ -8,7 +8,7 @@ namespace Archie.Scanner.DotNet;
 public sealed class DotNetScanner(DotNetScannerLimits? limits = null)
 {
     private const string ScannerId = "archie.dotnet";
-    private const string ScannerVersion = "1.2.0";
+    private const string ScannerVersion = "1.3.0";
     private readonly DotNetScannerLimits limits = limits ?? new();
 
     public async Task<DotNetScanResult> ScanAsync(string repositoryRoot, CancellationToken cancellationToken)
@@ -222,9 +222,20 @@ public sealed class DotNetScanner(DotNetScannerLimits? limits = null)
         }
 
         if (diagnostics.Any(item => item.Severity == "error")) return new([], diagnostics.OrderBy(item => item.Id, StringComparer.Ordinal).ToArray());
+        var sourceOwnership = structure.Projects
+            .SelectMany(project => project.Sources.Select(source => new SourceOwnershipClaim(
+                ScannerId, ScannerVersion, source.Path, project.Key, SourceOwnershipKind.Project,
+                Confidence.Confirmed, Resolution.Resolved, "msbuild:compile-item-ownership")))
+            .DistinctBy(item => (item.Path, item.OwnerCandidateKey))
+            .OrderBy(item => item.Path, StringComparer.Ordinal)
+            .ThenBy(item => item.OwnerCandidateKey, StringComparer.Ordinal)
+            .ToArray();
         return new(
             observations.DistinctBy(item => item.Id).OrderBy(item => item.Id, StringComparer.Ordinal).ToArray(),
-            diagnostics.DistinctBy(item => item.Id).OrderBy(item => item.Id, StringComparer.Ordinal).ToArray());
+            diagnostics.DistinctBy(item => item.Id).OrderBy(item => item.Id, StringComparer.Ordinal).ToArray())
+        {
+            SourceOwnership = sourceOwnership
+        };
     }
 
     private static EntityCandidate SolutionCandidate(SolutionModel solution) =>

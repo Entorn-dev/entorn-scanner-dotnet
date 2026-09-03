@@ -461,6 +461,10 @@ public sealed class DotNetScannerTests
         Assert.Contains(ownership, item => item.From.Key == "dotnet:project:Same/Two.csproj" && item.To.Name == "GET /shared-owner");
         Assert.Contains(ownership, item => item.From.Key == "dotnet:project:Linked/Linked.csproj" && item.To.Name == "GET /linked");
         Assert.DoesNotContain(ownership, item => item.To.Name == "GET /excluded");
+        Assert.Contains(result.SourceOwnership, item => item.Path == "Same/Included.cs" && item.OwnerCandidateKey == "dotnet:project:Same/One.csproj");
+        Assert.Contains(result.SourceOwnership, item => item.Path == "Same/Included.cs" && item.OwnerCandidateKey == "dotnet:project:Same/Two.csproj");
+        Assert.Contains(result.SourceOwnership, item => item.Path == "Shared/Endpoint.cs" && item.OwnerCandidateKey == "dotnet:project:Linked/Linked.csproj");
+        Assert.DoesNotContain(result.SourceOwnership, item => item.Path == "Same/Excluded.cs");
     }
 
     [Fact]
@@ -1922,7 +1926,7 @@ public sealed class DotNetScannerTests
     private static ObservationBundle Bundle(DotNetScanResult result) => new(
         "observations/v1", ObservationSource.Scanner, new string('a', 64),
         new("dotnet-reference", null, "reference", false, new string('b', 64)),
-        [new("archie.dotnet", "1.2.0")], result.Observations, result.Diagnostics, []);
+        [new("archie.dotnet", "1.3.0")], result.Observations, result.Diagnostics, []);
 
     private static string Fixture() => Path.Combine(AppContext.BaseDirectory, "fixtures", "dotnet-reference");
 

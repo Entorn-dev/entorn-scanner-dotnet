@@ -10,6 +10,7 @@ public sealed record DotNetScanResult(
     IReadOnlyList<Observation> Observations,
     IReadOnlyList<Diagnostic> Diagnostics)
 {
+    public IReadOnlyList<SourceOwnershipClaim> SourceOwnership { get; init; } = [];
     public bool Succeeded => Diagnostics.All(item => item.Severity != "error");
 }
 
