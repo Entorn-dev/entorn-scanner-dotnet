@@ -7,7 +7,7 @@ The worker implements the language-neutral [`scanner/v1` protocol](https://githu
 ## Build and test
 
 ```bash
-dotnet restore --locked-mode
+dotnet restore --locked-mode --runtime linux-x64
 dotnet test --no-restore --configuration Release
 ```
 
