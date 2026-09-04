@@ -16,10 +16,12 @@ jobs:
       - uses: actions/setup-dotnet@v4
         with:
           global-json-file: global.json
-      - name: Package exact tag
-        run: scripts/package-linux-x64.sh "${GITHUB_REF_NAME#v}"
+      - name: Restore
+        run: dotnet restore --locked-mode --runtime linux-x64
       - name: Test
         run: dotnet test --no-restore --configuration Release
+      - name: Package exact tag
+        run: scripts/package-linux-x64.sh "${GITHUB_REF_NAME#v}"
       - name: Publish immutable release bytes
         env:
           GH_TOKEN: ${{ github.token }}
