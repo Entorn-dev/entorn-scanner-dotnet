@@ -11,8 +11,7 @@
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="../../src/Archie.Scanner.DotNet/Archie.Scanner.DotNet.csproj" />
-    <ProjectReference Include="../../src/Archie.Core/Archie.Core.csproj" />
-    <Using Include="Archie.Scanner.Contracts" />
+    <Using Include="Entorn.Scanner.Contracts" />
   </ItemGroup>
   <ItemGroup>
     <Content Include="../fixtures/dotnet-reference/**/*" Link="fixtures/dotnet-reference/%(RecursiveDir)%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />

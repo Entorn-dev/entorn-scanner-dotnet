@@ -1,12 +1,11 @@
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Diagnostics;
-using Archie.Contracts;
-using Archie.Core;
 using Archie.Scanner.DotNet;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Xunit;
+using ContractJson = Entorn.Scanner.Contracts.ScannerContractJson;
 
 namespace Archie.Scanner.DotNet.Tests;
 
@@ -130,7 +129,7 @@ public sealed class DotNetScannerTests
     }
 
     [Fact]
-    public async Task ScannerOutputAndReconciledGraphAreByteDeterministic()
+    public async Task ScannerOutputIsByteDeterministic()
     {
         var scanner = new DotNetScanner();
         var first = await scanner.ScanAsync(Fixture(), CancellationToken.None);
@@ -139,11 +138,6 @@ public sealed class DotNetScannerTests
         var secondBundle = Bundle(second);
 
         Assert.Equal(ContractJson.WriteObservationBundle(firstBundle), ContractJson.WriteObservationBundle(secondBundle));
-        var firstGraph = new Reconciler().Reconcile(firstBundle, null, new DateOnly(2026, 9, 2)).Snapshot;
-        var secondGraph = new Reconciler().Reconcile(secondBundle, null, new DateOnly(2026, 9, 2)).Snapshot;
-        Assert.Equal(ContractJson.WriteGraphSnapshot(firstGraph), ContractJson.WriteGraphSnapshot(secondGraph));
-        Assert.Contains(firstGraph.Nodes, item => item.Kind == NodeKind.HttpEndpoint && item.Name == "POST /api/orders");
-        Assert.Contains(firstGraph.Edges, item => item.Kind == EdgeKind.Exposes);
     }
 
     [Theory]

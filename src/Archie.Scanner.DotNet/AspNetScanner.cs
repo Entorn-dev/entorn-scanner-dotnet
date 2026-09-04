@@ -1,7 +1,7 @@
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
-using Diagnostic = Archie.Scanner.Contracts.Diagnostic;
+using Diagnostic = Entorn.Scanner.Contracts.Diagnostic;
 
 namespace Archie.Scanner.DotNet;
 

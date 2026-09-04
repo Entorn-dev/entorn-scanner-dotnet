@@ -1,0 +1,26 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+      - name: Package exact tag
+        run: scripts/package-linux-x64.sh "${GITHUB_REF_NAME#v}"
+      - name: Test
+        run: dotnet test --no-restore --configuration Release
+      - name: Publish immutable release bytes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" artifacts/*.tar.gz artifacts/*.sha256 --verify-tag --generate-notes

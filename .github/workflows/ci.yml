@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+      - run: dotnet restore --locked-mode
+      - run: dotnet test --no-restore --configuration Release
+      - name: Verify reproducible archive
+        run: |
+          scripts/package-linux-x64.sh 1.3.0
+          cp artifacts/entorn-scanner-dotnet-linux-x64-1.3.0.tar.gz /tmp/first.tar.gz
+          scripts/package-linux-x64.sh 1.3.0
+          cmp /tmp/first.tar.gz artifacts/entorn-scanner-dotnet-linux-x64-1.3.0.tar.gz

@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Archie.Scanner.DotNet/Archie.Scanner.DotNet.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Archie.Scanner.DotNet.Tests/Archie.Scanner.DotNet.Tests.csproj" />
+  </Folder>
+</Solution>

@@ -1,0 +1,11 @@
+Entorn Scanner for .NET includes the following direct dependencies in its binary distribution:
+
+- Azure.Messaging.ServiceBus 7.20.1 — MIT
+- Confluent.Kafka 2.12.0 — Apache-2.0
+- Microsoft.CodeAnalysis.CSharp 5.0.0 — MIT
+- Microsoft.EntityFrameworkCore.Sqlite 10.0.11 — MIT
+- Microsoft.Azure.Functions.Worker 2.51.0 — MIT
+- Microsoft.Azure.Functions.Worker.Extensions.ServiceBus 5.24.0 — MIT
+- Entorn.Scanner.Contracts 1.0.0 — Apache-2.0
+
+Their transitive dependencies retain their respective copyright and license terms. NuGet package metadata and lock files identify the exact dependency closure used for each release.
